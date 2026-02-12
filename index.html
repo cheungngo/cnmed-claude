@@ -279,6 +279,13 @@ const MODELS=[
 const TIERS={opus:"Opus",sonnet:"Sonnet",haiku:"Haiku",other:"Other"};
 const MAX_CONT=20;
 
+/* ═══ ROBUSTNESS CONSTANTS ═══ */
+const FETCH_TIMEOUT_MS=180000;   /* 3 min per request */
+const MAX_RETRIES=2;             /* retries on 429/529/network */
+const RETRY_BASE_MS=3000;        /* 3s base backoff */
+const CONT_DELAY_MS=1500;        /* pause between auto-continues */
+const MAX_HISTORY_CHARS=800000;  /* ~800 KB rough payload guard */
+
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
 const chatArea=$('chatArea'),uInp=$('uInp'),sendBtn=$('sendBtn'),
@@ -293,6 +300,9 @@ const rawContentMap=new WeakMap();
 let lastContState=null;
 function gc(id){return chats.find(c=>c.id===(id||curId))}
 function cc(){return gc(curId)}
+
+/* ═══ UTILITY: sleep ═══ */
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 
 /* ═══ STORAGE ═══ */
 function save(){try{localStorage.setItem('ccs',JSON.stringify({chats,curId}))}catch(e){}}
@@ -343,6 +353,61 @@ function looksIncomplete(text){
     if(/[a-zA-Z,(\[{=]/.test(last))return true;
   }
   return false;
+}
+
+/* ═══ HISTORY TRIMMING — prevents context overflow ═══ */
+function trimHistory(history){
+  /* Keep system-like first message if any, trim oldest pairs */
+  let safety=0;
+  while(history.length>2&&JSON.stringify(history).length>MAX_HISTORY_CHARS&&safety<200){
+    /* Remove the two oldest messages (user+assistant pair) */
+    history.splice(0,2);
+    safety++;
+  }
+  /* Final sanity: if a single message is still too large, truncate its content */
+  if(history.length>0&&JSON.stringify(history).length>MAX_HISTORY_CHARS){
+    for(let i=0;i<history.length;i++){
+      if(typeof history[i].content==='string'&&history[i].content.length>50000){
+        history[i].content=history[i].content.slice(0,50000)+'\n\n[…truncated due to context length…]';
+      }
+    }
+  }
+  return history;
+}
+
+/* ═══ FETCH WITH TIMEOUT + RETRY ═══ */
+async function fetchWithRetry(url,opts,retries){
+  if(retries===undefined)retries=MAX_RETRIES;
+  let lastErr;
+  for(let attempt=0;attempt<=retries;attempt++){
+    const controller=new AbortController();
+    const tid=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
+    try{
+      const res=await fetch(url,{...opts,signal:controller.signal});
+      clearTimeout(tid);
+      /* Retry on transient server errors */
+      if((res.status===429||res.status===529||res.status>=500)&&attempt<retries){
+        const delay=RETRY_BASE_MS*Math.pow(2,attempt);
+        console.warn('[fetchWithRetry] HTTP',res.status,'— retrying in',delay+'ms (attempt',attempt+1+'/'+retries+')');
+        await sleep(delay);
+        continue;
+      }
+      return res;
+    }catch(e){
+      clearTimeout(tid);
+      lastErr=e;
+      if(e.name==='AbortError'){
+        lastErr=new Error('Request timed out after '+(FETCH_TIMEOUT_MS/1000)+'s');
+      }
+      if(attempt<retries){
+        const delay=RETRY_BASE_MS*Math.pow(2,attempt);
+        console.warn('[fetchWithRetry] Network error, retrying in',delay+'ms:',e.message);
+        await sleep(delay);
+        continue;
+      }
+    }
+  }
+  throw lastErr||new Error('Fetch failed after retries');
 }
 
 /* ═══ MARKDOWN ═══ */
@@ -634,7 +699,7 @@ async function send(){
 
     console.log('[auto-continue] Sending request, messages:',messages.length,'continuation:',contCount);
 
-    const res=await fetch('/.netlify/functions/claude-proxy',{
+    const res=await fetchWithRetry('/.netlify/functions/claude-proxy',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
     });
 
@@ -667,7 +732,6 @@ async function send(){
                   localIn=ev.message.usage.input_tokens||0;
                   if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens;
                 }
-                /* Some proxies put stop_reason in message_start (usually null) */
                 if(ev.message?.stop_reason)localStop=ev.message.stop_reason;
                 break;
               case'content_block_start':
@@ -680,13 +744,11 @@ async function send(){
               case'content_block_stop':break;
               case'message_delta':
                 if(ev.usage)localOut=ev.usage.output_tokens||0;
-                /* Capture stop_reason from multiple possible paths */
                 if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
                 else if(ev.stop_reason)localStop=ev.stop_reason;
                 console.log('[auto-continue] message_delta — stop_reason:',localStop,'outTok:',localOut);
                 break;
               case'message_stop':
-                /* Some proxies relay stop_reason here */
                 if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
                 else if(ev.stop_reason)localStop=ev.stop_reason;
                 break;
@@ -711,7 +773,6 @@ async function send(){
         if(data.usage.cache_read_input_tokens)localCache=data.usage.cache_read_input_tokens;
       }
       localStop=data.stop_reason||'';
-      /* Update UI */
       if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
     }
 
@@ -729,6 +790,9 @@ async function send(){
   }
 
   try{
+    /* ── Trim history before initial request ── */
+    trimHistory(c.history);
+
     /* ── Initial request ── */
     let result=await doRequest(c.history);
     totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
@@ -739,6 +803,12 @@ async function send(){
         (!result.stopReason&&replyTxt.length>500&&looksIncomplete(replyTxt));
       if(!shouldContinue)break;
 
+      /* Safety: if stopReason is missing/unknown and not heuristically truncated, bail */
+      if(!result.stopReason&&!looksIncomplete(replyTxt)){
+        console.log('[auto-continue] No stop_reason and text looks complete, stopping');
+        break;
+      }
+
       contCount++;
       console.log('[auto-continue] Starting continuation',contCount,'/',MAX_CONT);
 
@@ -747,25 +817,32 @@ async function send(){
       el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Auto-continuing… ('+contCount+'/'+MAX_CONT+')</div>';
       scrollEnd();
 
+      /* Delay between continuations to avoid rate-limiting */
+      await sleep(CONT_DELAY_MS);
+
       /* Thinking separator */
       if(thinkTxt&&isThink){
         thinkTxt+='\n\n─── Continuation '+contCount+' ───\n\n';
         updStreamThink(el,thinkTxt);
       }
 
-      /* Build continuation messages */
+      /* Build continuation messages — trim if too large */
       const contMsgs=[
         ...c.history,
         {role:'assistant',content:replyTxt},
         {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
       ];
+      trimHistory(contMsgs);
 
       const textBefore=replyTxt.length;
       try{
         result=await doRequest(contMsgs);
         totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
       }catch(contErr){
-        console.warn('[auto-continue] Continuation failed:',contErr.message);
+        console.warn('[auto-continue] Continuation',contCount,'failed:',contErr.message);
+        /* Show the error in the status area, then stop the loop */
+        el.contStatus.style.display='';
+        el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Auto-continue stopped: '+esc(contErr.message)+'</div>';
         break;
       }
 
@@ -805,7 +882,6 @@ async function send(){
       mcBtn.onclick=()=>manualContinue();
       el.ft.style.display='';
       el.ft.appendChild(mcBtn);
-      /* Store state for manual continue */
       lastContState={chatId:c.id,replyTxt,thinkTxt,totalInTok,totalOutTok,totalCacheRead,contCount,el,model,modelId,isThink};
     } else {
       lastContState=null;
@@ -872,11 +948,13 @@ async function manualContinue(){
     c.msgs.pop();
   }
 
+  /* Build and trim continuation messages */
   const contMsgs=[
     ...c.history,
     {role:'assistant',content:replyTxt},
     {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
   ];
+  trimHistory(contMsgs);
 
   const reqBody={model:modelId,max_tokens:128000,messages:contMsgs,stream:true};
   if(isThink)reqBody.thinking={type:'enabled',budget_tokens:100000};
@@ -884,7 +962,7 @@ async function manualContinue(){
   let localIn=0,localOut=0,localCache=0,localStop='';
 
   try{
-    const res=await fetch('/.netlify/functions/claude-proxy',{
+    const res=await fetchWithRetry('/.netlify/functions/claude-proxy',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
     });
     if(!res.ok){const ed=await res.json().catch(()=>({}));throw new Error(ed.error?.message||ed.error||'HTTP '+res.status)}
@@ -923,8 +1001,9 @@ async function manualContinue(){
                 if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
                 else if(ev.stop_reason)localStop=ev.stop_reason;
                 break;
+              case'error':throw new Error(ev.error?.message||'Stream error');
             }
-          }catch(pe){}
+          }catch(pe){if(pe.message&&(pe.message.includes('Stream error')||pe.message.includes('error')))throw pe}
         }
       }
     } else {
@@ -942,11 +1021,16 @@ async function manualContinue(){
 
   }catch(err){
     console.warn('[manual-continue] Error:',err.message);
+    el.contStatus.style.display='';
+    el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Continue failed: '+esc(err.message)+'</div>';
   }
 
   /* Finalize */
   cur.remove();
-  el.contStatus.style.display='none';
+  /* Only hide contStatus if no error was shown */
+  if(!el.contStatus.querySelector('[style*="red"]')){
+    el.contStatus.style.display='none';
+  }
   if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
   el.body.innerHTML=renderMd(replyTxt||'(empty response)');
   el.cpBtn.style.display='';
@@ -997,4 +1081,3 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
-
