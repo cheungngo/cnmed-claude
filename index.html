@@ -73,7 +73,7 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 
 .msg-row{display:flex;flex-direction:column;max-width:780px;width:100%;margin:0 auto;animation:fadeUp .3s ease-out}
 @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.msg{padding:16px 20px;border-radius:var(--r);line-height:1.72;font-size:13.5px;word-wrap:break-word}
+.msg{padding:16px 20px;border-radius:var(--r);line-height:1.72;font-size:13.5px;word-wrap:break-word;position:relative}
 .msg.user{background:var(--ubg);border:1px solid var(--ubd);border-bottom-right-radius:4px}
 .msg.assistant{background:var(--abg);border:1px solid var(--abd);border-bottom-left-radius:4px}
 .msg-hdr{display:flex;align-items:center;gap:7px;margin-bottom:8px}
@@ -86,6 +86,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .msg-tm{font-size:9.5px;color:var(--tx3);margin-left:auto}
 .msg-body{white-space:pre-wrap}.msg-body.md{white-space:normal}
 .err-text{color:var(--red)}
+
+/* ═══ COPY RESPONSE BUTTON ═══ */
+.cp-resp-btn{background:var(--sf3);border:1px solid var(--bdr);color:var(--tx3);padding:3px 10px;border-radius:6px;font:500 10px/1 'Inter',sans-serif;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:4px;margin-left:8px;white-space:nowrap;flex-shrink:0}
+.cp-resp-btn:hover{color:var(--tx);background:var(--sb-hov);border-color:var(--bdr2)}
+.cp-resp-btn.copied{color:var(--grn);border-color:rgba(74,222,128,.25);background:rgba(74,222,128,.06)}
 
 /* ═══ THINKING ═══ */
 .think{margin-bottom:14px;border-radius:var(--rs);border:1px solid var(--tbd);background:var(--tbg);overflow:hidden;border-left:3px solid var(--ac)}
@@ -120,9 +125,10 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .md .il{background:rgba(139,124,246,.1);padding:1.5px 5px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:var(--ac2)}
 .md .cb{position:relative;margin:10px 0;border-radius:8px;overflow:hidden;background:#0d0d12;border:1px solid var(--bdr)}
 .md .cb-hd{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--bdr);font-size:10px;color:var(--tx3)}
-.md .cp-btn{background:var(--sf3);border:1px solid var(--bdr);color:var(--tx3);padding:2px 8px;border-radius:4px;font-size:10px;font-family:'Inter',sans-serif;cursor:pointer;transition:.15s}
+.md .cp-btn{background:var(--sf3);border:1px solid var(--bdr);color:var(--tx3);padding:3px 10px;border-radius:5px;font:500 10px/1 'Inter',sans-serif;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:4px}
 .md .cp-btn:hover{color:var(--tx);background:var(--sb-hov)}
-.md .cb code{display:block;padding:12px;overflow-x:auto;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;color:var(--tx2)}
+.md .cp-btn.copied{color:var(--grn);border-color:rgba(74,222,128,.25)}
+.md .cb code{display:block;padding:12px;overflow-x:auto;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;color:var(--tx2);white-space:pre;tab-size:2}
 .md .cb code::-webkit-scrollbar{height:4px}.md .cb code::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
 .md .tbl-w{overflow-x:auto;margin:8px 0;border-radius:8px;border:1px solid var(--bdr)}
 .md table{border-collapse:collapse;width:100%;font-size:12.5px}
@@ -259,6 +265,8 @@ const chatArea=$('chatArea'),uInp=$('uInp'),sendBtn=$('sendBtn'),
 
 /* ═══ STATE ═══ */
 let chats=[],curId=null,sending=false;
+/* Map to store raw response text per message row element for copy */
+const rawContentMap=new WeakMap();
 function gc(id){return chats.find(c=>c.id===(id||curId))}
 function cc(){return gc(curId)}
 
@@ -315,7 +323,7 @@ function renderMd(src){
   while(i<L.length){
     const ln=L[i];
     const cbm=ln.trim().match(/^\x00CB(\d+)\x00$/);
-    if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">Copy</button></div><code>'+esc(b.c)+'</code></div>';i++;continue}
+    if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(b.c)+'</code></div>';i++;continue}
     const hm=ln.match(/^(#{1,6})\s+(.+)/);
     if(hm){h+='<h'+hm[1].length+'>'+il(hm[2])+'</h'+hm[1].length+'>';i++;continue}
     if(/^(-{3,}|\*{3,}|_{3,})\s*$/.test(ln.trim())){h+='<hr>';i++;continue}
@@ -334,7 +342,28 @@ function renderMd(src){
   }
   return h;
 }
-function cpCode(btn){const code=btn.closest('.cb').querySelector('code').textContent;navigator.clipboard.writeText(code).then(()=>{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',2000)})}
+function cpCode(btn){
+  const code=btn.closest('.cb').querySelector('code').textContent;
+  navigator.clipboard.writeText(code).then(()=>{
+    btn.textContent='✓ Copied!';btn.classList.add('copied');
+    setTimeout(()=>{btn.textContent='📋 Copy Code';btn.classList.remove('copied')},2000);
+  });
+}
+
+/* ═══ COPY RESPONSE (excluding thinking) ═══ */
+function cpResp(btn){
+  const row=btn.closest('.msg-row');
+  const raw=rawContentMap.get(row);
+  if(!raw&&raw!==''){
+    /* fallback: extract text from body */
+    const body=row.querySelector('.msg-body');
+    if(body)navigator.clipboard.writeText(body.textContent);
+  } else {
+    navigator.clipboard.writeText(raw);
+  }
+  btn.innerHTML='✓ Copied';btn.classList.add('copied');
+  setTimeout(()=>{btn.innerHTML='📋 Copy';btn.classList.remove('copied')},2000);
+}
 
 /* ═══ SIDEBAR ═══ */
 function renderSB(){
@@ -423,6 +452,11 @@ function appendEl(data,idx,anim=true){
   hdr.appendChild(av);hdr.appendChild(nm);
   if(data.modelLabel){const ml=document.createElement('span');ml.className='msg-ml';ml.textContent='· '+data.modelLabel;hdr.appendChild(ml)}
   if(data.ts){const t=document.createElement('span');t.className='msg-tm';t.textContent=fmtT(data.ts);hdr.appendChild(t)}
+  /* Copy response button for assistant messages */
+  if(data.role==='assistant'&&!data.isError){
+    const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.onclick=function(){cpResp(this)};
+    hdr.appendChild(cpBtn);
+  }
   msg.appendChild(hdr);
 
   if(data.thinking){
@@ -450,6 +484,8 @@ function appendEl(data,idx,anim=true){
     msg.appendChild(ft);
   }
   row.appendChild(msg);chatArea.appendChild(row);
+  /* Store raw content for copy (excluding thinking) */
+  if(data.role==='assistant'&&!data.isError){rawContentMap.set(row,data.content||'')}
 }
 
 /* ═══ STREAM HELPERS ═══ */
@@ -461,6 +497,9 @@ function mkStreamEl(model){
 
   const hdr=document.createElement('div');hdr.className='msg-hdr';
   hdr.innerHTML='<div class="msg-av">✦</div><span class="msg-nm">Claude</span>'+(model?'<span class="msg-ml">· '+esc(model.label)+'</span>':'')+'<span class="msg-tm">'+fmtT(Date.now())+'</span>';
+  /* Copy response button (hidden during streaming, shown on finalize) */
+  const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.style.display='none';cpBtn.onclick=function(){cpResp(this)};
+  hdr.appendChild(cpBtn);
   msg.appendChild(hdr);
 
   const tk=document.createElement('div');tk.className='think open';tk.style.display='none';
@@ -476,7 +515,7 @@ function mkStreamEl(model){
   msg.appendChild(ft);
   row.appendChild(msg);
 
-  return{row,msg,tk,body,cur,ft,ttx:tk.querySelector('.think-tx'),tmt:tk.querySelector('.think-mt'),tlb:tk.querySelector('.think-lb')};
+  return{row,msg,tk,body,cur,ft,cpBtn,ttx:tk.querySelector('.think-tx'),tmt:tk.querySelector('.think-mt'),tlb:tk.querySelector('.think-lb')};
 }
 
 let mdTimer=null;
@@ -521,8 +560,8 @@ async function send(){
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
 
-  const reqBody={model:modelId,max_tokens:isThink?16000:8192,messages:c.history};
-  if(isThink)reqBody.thinking={type:'enabled',budget_tokens:10000};
+  const reqBody={model:modelId,max_tokens:128000,messages:c.history};
+  if(isThink)reqBody.thinking={type:'enabled',budget_tokens:100000};
 
   let thinkTxt='',replyTxt='',usage={},inTok=0,outTok=0;
 
@@ -591,6 +630,10 @@ async function send(){
     el.cur.remove();
     if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
     el.body.innerHTML=renderMd(replyTxt||'(empty response)');
+
+    /* Show copy response button and store raw content */
+    el.cpBtn.style.display='';
+    rawContentMap.set(el.row,replyTxt||'(empty response)');
 
     usage.input_tokens=inTok;usage.output_tokens=outTok;
     c.tokIn+=inTok;c.tokOut+=outTok;
