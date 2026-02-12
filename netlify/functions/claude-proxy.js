@@ -30,7 +30,6 @@ exports.handler = async (event) => {
     });
 
     clearTimeout(timeout);
-
     const data = await response.text();
 
     return {
