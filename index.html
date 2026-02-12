@@ -277,7 +277,7 @@ const MODELS=[
 {id:"ggg-5-codex-high",label:"GGG-5 Codex High",pi:.939,po:7.512,tier:"other"},
 ];
 const TIERS={opus:"Opus",sonnet:"Sonnet",haiku:"Haiku",other:"Other"};
-const MAX_CONT=5;
+const MAX_CONT=20;
 
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
@@ -307,7 +307,7 @@ function load(){try{const d=localStorage.getItem('ccs');if(d){const s=JSON.parse
     modSel.appendChild(g);
   }
 })();
-modSel.value="claude-sonnet-4-5-20250929";
+modSel.value="claude-opus-4-6";
 modSel.addEventListener('change',()=>{
   updPrice();
   const c=cc();
@@ -997,3 +997,4 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
+
