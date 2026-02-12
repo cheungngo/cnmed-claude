@@ -284,7 +284,16 @@ function load(){try{const d=localStorage.getItem('ccs');if(d){const s=JSON.parse
   }
 })();
 modSel.value="claude-sonnet-4-5-20250929";
-modSel.addEventListener('change',updPrice);
+/* FIX: model change now updates current chat's modelId + sidebar */
+modSel.addEventListener('change',()=>{
+  updPrice();
+  const c=cc();
+  if(c){
+    c.modelId=modSel.value;
+    renderSB();
+    save();
+  }
+});
 function updPrice(){
   const m=MODELS.find(x=>x.id===modSel.value);
   if(!m){prDisp.innerHTML='';return}
@@ -302,7 +311,7 @@ function updCost(){
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function fmtT(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
 
-/* ═══ MARKDOWN ═══ */
+/* ═══ MARKDOWN (with indented code block support) ═══ */
 function renderMd(src){
   if(!src)return'';
   const cbs=[],ics=[];
@@ -322,6 +331,18 @@ function renderMd(src){
   const L=src.split('\n');let h='',i=0;
   while(i<L.length){
     const ln=L[i];
+
+    /* ── Indented code block (4+ spaces or tab) ── */
+    if(/^\s{4,}|^\t/.test(ln)){
+      let code='';
+      while(i<L.length&&(/^\s{4,}|^\t/.test(L[i])||L[i].trim()==='')){
+        code+=L[i].replace(/^\s{4,}|^\t/,'')+'\n';
+        i++;
+      }
+      h+='<div class="cb"><div class="cb-hd"><span>code</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(code)+'</code></div>';
+      continue;
+    }
+
     const cbm=ln.trim().match(/^\x00CB(\d+)\x00$/);
     if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(b.c)+'</code></div>';i++;continue}
     const hm=ln.match(/^(#{1,6})\s+(.+)/);
@@ -336,7 +357,7 @@ function renderMd(src){
       h+='</tbody></table></div>';continue}
     if(!ln.trim()){i++;continue}
     let p='';
-    while(i<L.length&&L[i].trim()&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+[.)]\s+/.test(L[i])&&!/^>\s?/.test(L[i])&&!/^(-{3,}|\*{3,}|_{3,})\s*$/.test(L[i].trim())&&!/^\x00CB/.test(L[i].trim())&&!(L[i].includes('|')&&i+1<L.length&&/^\|?\s*:?-+:?\s*/.test(L[i+1]))){
+    while(i<L.length&&L[i].trim()&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+[.)]\s+/.test(L[i])&&!/^>\s?/.test(L[i])&&!/^(-{3,}|\*{3,}|_{3,})\s*$/.test(L[i].trim())&&!/^\x00CB/.test(L[i].trim())&&!(L[i].includes('|')&&i+1<L.length&&/^\|?\s*:?-+:?\s*/.test(L[i+1]))&&!/^\s{4,}|^\t/.test(L[i])){
       p+=(p?'<br>':'')+il(L[i]);i++}
     if(p)h+='<p>'+p+'</p>';
   }
