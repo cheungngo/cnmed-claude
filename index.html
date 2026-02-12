@@ -265,7 +265,6 @@ const chatArea=$('chatArea'),uInp=$('uInp'),sendBtn=$('sendBtn'),
 
 /* ═══ STATE ═══ */
 let chats=[],curId=null,sending=false;
-/* Map to store raw response text per message row element for copy */
 const rawContentMap=new WeakMap();
 function gc(id){return chats.find(c=>c.id===(id||curId))}
 function cc(){return gc(curId)}
@@ -284,7 +283,7 @@ function load(){try{const d=localStorage.getItem('ccs');if(d){const s=JSON.parse
   }
 })();
 modSel.value="claude-sonnet-4-5-20250929";
-/* FIX: model change now updates current chat's modelId + sidebar */
+/* FIX 1: model change updates current chat + sidebar */
 modSel.addEventListener('change',()=>{
   updPrice();
   const c=cc();
@@ -311,11 +310,16 @@ function updCost(){
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function fmtT(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
 
-/* ═══ MARKDOWN (with indented code block support) ═══ */
+/* ═══ MARKDOWN ═══ */
+/* FIX 2: handles unclosed fenced blocks (streaming) + conservative indented code */
 function renderMd(src){
   if(!src)return'';
   const cbs=[],ics=[];
+  /* 1. Extract closed fenced code blocks */
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(_,l,c)=>{cbs.push({l:l||'',c});return'\x00CB'+(cbs.length-1)+'\x00'});
+  /* 2. Handle unclosed fenced code block (mid-stream: opening ``` without closing) */
+  src=src.replace(/```(\w*)\n([\s\S]*)$/,(_,l,c)=>{cbs.push({l:l||'',c});return'\x00CB'+(cbs.length-1)+'\x00'});
+  /* 3. Inline code */
   src=src.replace(/`([^`\n]+)`/g,(_,c)=>{ics.push(c);return'\x00IC'+(ics.length-1)+'\x00'});
   function il(t){
     t=esc(t);
@@ -328,38 +332,40 @@ function renderMd(src){
     return t;
   }
   function tr(s){const c=s.split('|').map(x=>x.trim());if(c[0]==='')c.shift();if(c[c.length-1]==='')c.pop();return c}
-  const L=src.split('\n');let h='',i=0;
+  const L=src.split('\n');let h='',i=0,prevBlank=true;
   while(i<L.length){
     const ln=L[i];
 
-    /* ── Indented code block (4+ spaces or tab) ── */
-    if(/^\s{4,}|^\t/.test(ln)){
+    /* ── Indented code block: only after a blank line, 4+ spaces or tab ── */
+    if(prevBlank&&/^(\s{4,}|\t)/.test(ln)&&!/^\s*[-*+]\s+/.test(ln)&&!/^\s*\d+[.)]\s+/.test(ln)){
       let code='';
-      while(i<L.length&&(/^\s{4,}|^\t/.test(L[i])||L[i].trim()==='')){
-        code+=L[i].replace(/^\s{4,}|^\t/,'')+'\n';
+      while(i<L.length&&(/^(\s{4,}|\t)/.test(L[i])||L[i].trim()==='')){
+        code+=L[i].replace(/^(\s{4}|\t)/,'')+'\n';
         i++;
       }
+      code=code.replace(/\n+$/,'\n');
       h+='<div class="cb"><div class="cb-hd"><span>code</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(code)+'</code></div>';
-      continue;
+      prevBlank=false;continue;
     }
 
     const cbm=ln.trim().match(/^\x00CB(\d+)\x00$/);
-    if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(b.c)+'</code></div>';i++;continue}
+    if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(b.c)+'</code></div>';prevBlank=false;i++;continue}
     const hm=ln.match(/^(#{1,6})\s+(.+)/);
-    if(hm){h+='<h'+hm[1].length+'>'+il(hm[2])+'</h'+hm[1].length+'>';i++;continue}
-    if(/^(-{3,}|\*{3,}|_{3,})\s*$/.test(ln.trim())){h+='<hr>';i++;continue}
-    if(/^>\s?/.test(ln)){let bq='';while(i<L.length&&/^>\s?/.test(L[i])){bq+=(bq?'<br>':'')+il(L[i].replace(/^>\s?/,''));i++}h+='<blockquote>'+bq+'</blockquote>';continue}
-    if(/^\s*[-*+]\s+/.test(ln)){h+='<ul>';while(i<L.length&&/^\s*[-*+]\s+/.test(L[i])){h+='<li>'+il(L[i].replace(/^\s*[-*+]\s+/,''))+'</li>';i++}h+='</ul>';continue}
-    if(/^\s*\d+[.)]\s+/.test(ln)){h+='<ol>';while(i<L.length&&/^\s*\d+[.)]\s+/.test(L[i])){h+='<li>'+il(L[i].replace(/^\s*\d+[.)]\s+/,''))+'</li>';i++}h+='</ol>';continue}
+    if(hm){h+='<h'+hm[1].length+'>'+il(hm[2])+'</h'+hm[1].length+'>';prevBlank=false;i++;continue}
+    if(/^(-{3,}|\*{3,}|_{3,})\s*$/.test(ln.trim())){h+='<hr>';prevBlank=false;i++;continue}
+    if(/^>\s?/.test(ln)){let bq='';while(i<L.length&&/^>\s?/.test(L[i])){bq+=(bq?'<br>':'')+il(L[i].replace(/^>\s?/,''));i++}h+='<blockquote>'+bq+'</blockquote>';prevBlank=false;continue}
+    if(/^\s*[-*+]\s+/.test(ln)){h+='<ul>';while(i<L.length&&/^\s*[-*+]\s+/.test(L[i])){h+='<li>'+il(L[i].replace(/^\s*[-*+]\s+/,''))+'</li>';i++}h+='</ul>';prevBlank=false;continue}
+    if(/^\s*\d+[.)]\s+/.test(ln)){h+='<ol>';while(i<L.length&&/^\s*\d+[.)]\s+/.test(L[i])){h+='<li>'+il(L[i].replace(/^\s*\d+[.)]\s+/,''))+'</li>';i++}h+='</ol>';prevBlank=false;continue}
     if(ln.includes('|')&&i+1<L.length&&/^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(L[i+1])){
       const hc=tr(ln);i+=2;h+='<div class="tbl-w"><table><thead><tr>';hc.forEach(c=>h+='<th>'+il(c)+'</th>');h+='</tr></thead><tbody>';
       while(i<L.length&&L[i].includes('|')&&L[i].trim()){h+='<tr>';tr(L[i]).forEach(c=>h+='<td>'+il(c)+'</td>');h+='</tr>';i++}
-      h+='</tbody></table></div>';continue}
-    if(!ln.trim()){i++;continue}
+      h+='</tbody></table></div>';prevBlank=false;continue}
+    if(!ln.trim()){prevBlank=true;i++;continue}
     let p='';
-    while(i<L.length&&L[i].trim()&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+[.)]\s+/.test(L[i])&&!/^>\s?/.test(L[i])&&!/^(-{3,}|\*{3,}|_{3,})\s*$/.test(L[i].trim())&&!/^\x00CB/.test(L[i].trim())&&!(L[i].includes('|')&&i+1<L.length&&/^\|?\s*:?-+:?\s*/.test(L[i+1]))&&!/^\s{4,}|^\t/.test(L[i])){
+    while(i<L.length&&L[i].trim()&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+[.)]\s+/.test(L[i])&&!/^>\s?/.test(L[i])&&!/^(-{3,}|\*{3,}|_{3,})\s*$/.test(L[i].trim())&&!/^\x00CB/.test(L[i].trim())&&!(L[i].includes('|')&&i+1<L.length&&/^\|?\s*:?-+:?\s*/.test(L[i+1]))){
       p+=(p?'<br>':'')+il(L[i]);i++}
     if(p)h+='<p>'+p+'</p>';
+    prevBlank=false;
   }
   return h;
 }
@@ -376,7 +382,6 @@ function cpResp(btn){
   const row=btn.closest('.msg-row');
   const raw=rawContentMap.get(row);
   if(!raw&&raw!==''){
-    /* fallback: extract text from body */
     const body=row.querySelector('.msg-body');
     if(body)navigator.clipboard.writeText(body.textContent);
   } else {
@@ -473,7 +478,6 @@ function appendEl(data,idx,anim=true){
   hdr.appendChild(av);hdr.appendChild(nm);
   if(data.modelLabel){const ml=document.createElement('span');ml.className='msg-ml';ml.textContent='· '+data.modelLabel;hdr.appendChild(ml)}
   if(data.ts){const t=document.createElement('span');t.className='msg-tm';t.textContent=fmtT(data.ts);hdr.appendChild(t)}
-  /* Copy response button for assistant messages */
   if(data.role==='assistant'&&!data.isError){
     const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.onclick=function(){cpResp(this)};
     hdr.appendChild(cpBtn);
@@ -505,7 +509,6 @@ function appendEl(data,idx,anim=true){
     msg.appendChild(ft);
   }
   row.appendChild(msg);chatArea.appendChild(row);
-  /* Store raw content for copy (excluding thinking) */
   if(data.role==='assistant'&&!data.isError){rawContentMap.set(row,data.content||'')}
 }
 
@@ -518,7 +521,6 @@ function mkStreamEl(model){
 
   const hdr=document.createElement('div');hdr.className='msg-hdr';
   hdr.innerHTML='<div class="msg-av">✦</div><span class="msg-nm">Claude</span>'+(model?'<span class="msg-ml">· '+esc(model.label)+'</span>':'')+'<span class="msg-tm">'+fmtT(Date.now())+'</span>';
-  /* Copy response button (hidden during streaming, shown on finalize) */
   const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.style.display='none';cpBtn.onclick=function(){cpResp(this)};
   hdr.appendChild(cpBtn);
   msg.appendChild(hdr);
@@ -602,7 +604,6 @@ async function send(){
 
     const ct=res.headers.get('content-type')||'';
     if(ct.includes('text/event-stream')&&res.body){
-      /* ── SSE streaming ── */
       const reader=res.body.getReader();
       const dec=new TextDecoder();
       let buf='';
@@ -639,7 +640,6 @@ async function send(){
         }
       }
     } else {
-      /* ── JSON fallback ── */
       const data=await res.json();
       if(data.content&&Array.isArray(data.content)){
         for(const b of data.content){if(b.type==='thinking')thinkTxt+=b.thinking;else if(b.type==='text')replyTxt+=b.text}
@@ -652,7 +652,6 @@ async function send(){
     if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
     el.body.innerHTML=renderMd(replyTxt||'(empty response)');
 
-    /* Show copy response button and store raw content */
     el.cpBtn.style.display='';
     rawContentMap.set(el.row,replyTxt||'(empty response)');
 
