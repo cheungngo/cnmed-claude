@@ -21,7 +21,6 @@
 }
 html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--tx);overflow:hidden;-webkit-font-smoothing:antialiased}
 
-/* ═══ APP ═══ */
 .app{display:flex;height:100dvh;width:100%}
 
 /* ═══ SIDEBAR ═══ */
@@ -58,6 +57,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .price{font-size:10.5px;font-weight:500;display:flex;gap:5px;align-items:center}
 .price .pi{color:var(--grn)}.price .po{color:var(--yel)}.price .sp{color:var(--tx3)}
 .cost-b{font-size:10px;font-weight:600;color:var(--ac);background:var(--ac-g);padding:3px 9px;border-radius:20px;white-space:nowrap}
+
+/* ═══ AUTO-CONTINUE TOGGLE ═══ */
+.ac-toggle{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10.5px;color:var(--tx2);user-select:none;white-space:nowrap;flex-shrink:0}
+.ac-toggle input{accent-color:var(--ac);width:13px;height:13px;margin:0;cursor:pointer}
+.ac-toggle:hover{color:var(--tx)}
 
 /* ═══ CHAT WRAPPER ═══ */
 .chat-w{display:flex;flex:1;overflow:hidden}
@@ -141,6 +145,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .tk{font-size:9.5px;font-weight:500;color:var(--tx3);background:rgba(255,255,255,.03);border:1px solid var(--bdr);padding:2px 7px;border-radius:5px;display:inline-flex;align-items:center;gap:3px}
 .tk .n{color:var(--tx2)}
 
+/* ═══ CONTINUATION INDICATOR & BADGE ═══ */
+.cont-ind{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ac);font-weight:500;padding:8px 0;margin:6px 0}
+.cont-ind .pulse{width:8px;height:8px;border-radius:50%;background:var(--ac);animation:glow 1.5s ease-in-out infinite;flex-shrink:0}
+.cont-badge{font-size:9.5px;font-weight:500;color:var(--ac);background:var(--ac-g);border:1px solid rgba(139,124,246,.2);padding:2px 7px;border-radius:5px;display:inline-flex;align-items:center;gap:3px}
+
 /* ═══ CURSOR ═══ */
 .cursor{display:inline-block;width:6px;height:15px;background:var(--ac);animation:blink .8s step-end infinite;vertical-align:text-bottom;margin-left:2px;border-radius:1px}
 @keyframes blink{50%{opacity:0}}
@@ -190,6 +199,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
   #inpArea{padding:10px}
   #uInp{padding:10px 14px;font-size:13px}
   .btn{padding:10px 12px;font-size:11.5px}
+  .ac-toggle .ac-full{display:none}
+  .ac-toggle .ac-short{display:inline}
+}
+@media(min-width:769px){
+  .ac-toggle .ac-short{display:none}
 }
 </style>
 </head>
@@ -207,6 +221,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
     <div class="hdr">
       <button class="hamburger" onclick="toggleSB()">☰</button>
       <div class="sel-w"><select id="modSel"></select></div>
+      <label class="ac-toggle" title="Auto-continue when response is cut off by token limits">
+        <input type="checkbox" id="autoCont" checked>
+        <span class="ac-full">Auto-continue</span>
+        <span class="ac-short">↻</span>
+      </label>
       <div class="hdr-r">
         <div class="price" id="prDisp"></div>
         <div class="cost-b" id="costB" style="display:none">$0.0000</div>
@@ -283,15 +302,10 @@ function load(){try{const d=localStorage.getItem('ccs');if(d){const s=JSON.parse
   }
 })();
 modSel.value="claude-sonnet-4-5-20250929";
-/* FIX 1: model change updates current chat + sidebar */
 modSel.addEventListener('change',()=>{
   updPrice();
   const c=cc();
-  if(c){
-    c.modelId=modSel.value;
-    renderSB();
-    save();
-  }
+  if(c){c.modelId=modSel.value;renderSB();save()}
 });
 function updPrice(){
   const m=MODELS.find(x=>x.id===modSel.value);
@@ -311,15 +325,11 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 function fmtT(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
 
 /* ═══ MARKDOWN ═══ */
-/* FIX 2: handles unclosed fenced blocks (streaming) + conservative indented code */
 function renderMd(src){
   if(!src)return'';
   const cbs=[],ics=[];
-  /* 1. Extract closed fenced code blocks */
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(_,l,c)=>{cbs.push({l:l||'',c});return'\x00CB'+(cbs.length-1)+'\x00'});
-  /* 2. Handle unclosed fenced code block (mid-stream: opening ``` without closing) */
   src=src.replace(/```(\w*)\n([\s\S]*)$/,(_,l,c)=>{cbs.push({l:l||'',c});return'\x00CB'+(cbs.length-1)+'\x00'});
-  /* 3. Inline code */
   src=src.replace(/`([^`\n]+)`/g,(_,c)=>{ics.push(c);return'\x00IC'+(ics.length-1)+'\x00'});
   function il(t){
     t=esc(t);
@@ -335,19 +345,13 @@ function renderMd(src){
   const L=src.split('\n');let h='',i=0,prevBlank=true;
   while(i<L.length){
     const ln=L[i];
-
-    /* ── Indented code block: only after a blank line, 4+ spaces or tab ── */
     if(prevBlank&&/^(\s{4,}|\t)/.test(ln)&&!/^\s*[-*+]\s+/.test(ln)&&!/^\s*\d+[.)]\s+/.test(ln)){
       let code='';
-      while(i<L.length&&(/^(\s{4,}|\t)/.test(L[i])||L[i].trim()==='')){
-        code+=L[i].replace(/^(\s{4}|\t)/,'')+'\n';
-        i++;
-      }
+      while(i<L.length&&(/^(\s{4,}|\t)/.test(L[i])||L[i].trim()==='')){code+=L[i].replace(/^(\s{4}|\t)/,'')+'\n';i++}
       code=code.replace(/\n+$/,'\n');
       h+='<div class="cb"><div class="cb-hd"><span>code</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(code)+'</code></div>';
       prevBlank=false;continue;
     }
-
     const cbm=ln.trim().match(/^\x00CB(\d+)\x00$/);
     if(cbm){const b=cbs[+cbm[1]];h+='<div class="cb"><div class="cb-hd"><span>'+esc(b.l||'code')+'</span><button class="cp-btn" onclick="cpCode(this)">📋 Copy Code</button></div><code>'+esc(b.c)+'</code></div>';prevBlank=false;i++;continue}
     const hm=ln.match(/^(#{1,6})\s+(.+)/);
@@ -377,7 +381,7 @@ function cpCode(btn){
   });
 }
 
-/* ═══ COPY RESPONSE (excluding thinking) ═══ */
+/* ═══ COPY RESPONSE ═══ */
 function cpResp(btn){
   const row=btn.closest('.msg-row');
   const raw=rawContentMap.get(row);
@@ -501,11 +505,12 @@ function appendEl(data,idx,anim=true){
   else{body.textContent=data.content}
   msg.appendChild(body);
 
-  if(data.usage){
+  if(data.usage||data.continuations){
     const ft=document.createElement('div');ft.className='msg-ft';
-    const inp=data.usage.input_tokens||0,out=data.usage.output_tokens||0;
+    const inp=data.usage?.input_tokens||0,out=data.usage?.output_tokens||0;
     ft.innerHTML='<span class="tk">↑ in <span class="n">'+inp.toLocaleString()+'</span></span><span class="tk">↓ out <span class="n">'+out.toLocaleString()+'</span></span>';
-    if(data.usage.cache_read)ft.innerHTML+='<span class="tk">📦 cache <span class="n">'+data.usage.cache_read.toLocaleString()+'</span></span>';
+    if(data.usage?.cache_read)ft.innerHTML+='<span class="tk">📦 cache <span class="n">'+data.usage.cache_read.toLocaleString()+'</span></span>';
+    if(data.continuations>0)ft.innerHTML+='<span class="cont-badge">🔄 '+data.continuations+' continuation'+(data.continuations>1?'s':'')+'</span>';
     msg.appendChild(ft);
   }
   row.appendChild(msg);chatArea.appendChild(row);
@@ -560,7 +565,7 @@ function updStreamThink(el,txt){
 function nearBot(){return chatArea.scrollHeight-chatArea.scrollTop-chatArea.clientHeight<120}
 function scrollEnd(){requestAnimationFrame(()=>{chatArea.scrollTop=chatArea.scrollHeight})}
 
-/* ═══ SEND / STREAM ═══ */
+/* ═══ SEND / STREAM with AUTO-CONTINUE ═══ */
 async function send(){
   const text=uInp.value.trim();if(!text||sending)return;
   sending=true;
@@ -583,12 +588,20 @@ async function send(){
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
 
-  const reqBody={model:modelId,max_tokens:128000,messages:c.history};
-  if(isThink)reqBody.thinking={type:'enabled',budget_tokens:100000};
+  /* ── Accumulation state across continuations ── */
+  let thinkTxt='',replyTxt='';
+  let totalInTok=0,totalOutTok=0,totalCacheRead=0;
+  const MAX_CONT=5;
+  let contCount=0;
+  const autoContEnabled=$('autoCont').checked;
 
-  let thinkTxt='',replyTxt='',usage={},inTok=0,outTok=0;
+  /* ── Inner function: perform one streaming request ── */
+  async function doRequest(messages){
+    let localIn=0,localOut=0,localCache=0,localStop='';
 
-  try{
+    const reqBody={model:modelId,max_tokens:128000,messages};
+    if(isThink)reqBody.thinking={type:'enabled',budget_tokens:100000};
+
     const res=await fetch('/.netlify/functions/claude-proxy',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
     });
@@ -596,10 +609,7 @@ async function send(){
     if(!res.ok){
       const ed=await res.json().catch(()=>({}));
       const em=ed.error?.message||ed.error||'HTTP '+res.status;
-      el.cur.remove();el.tk.style.display='none';
-      el.body.innerHTML='<span class="err-text">Error: '+esc(em)+'</span>';
-      c.msgs.push({role:'assistant',content:'Error: '+em,isError:true,modelLabel:model?.label,ts:Date.now()});
-      save();sending=false;sendBtn.disabled=false;modSel.disabled=false;updNav();return;
+      throw new Error(em);
     }
 
     const ct=res.headers.get('content-type')||'';
@@ -621,7 +631,10 @@ async function send(){
             const ev=JSON.parse(ds);
             switch(ev.type){
               case'message_start':
-                if(ev.message?.usage){inTok=ev.message.usage.input_tokens||0;if(ev.message.usage.cache_read_input_tokens)usage.cache_read=ev.message.usage.cache_read_input_tokens}
+                if(ev.message?.usage){
+                  localIn=ev.message.usage.input_tokens||0;
+                  if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens;
+                }
                 break;
               case'content_block_start':
                 if(ev.content_block?.type==='thinking'){el.tk.style.display=''}
@@ -632,19 +645,79 @@ async function send(){
                 break;
               case'content_block_stop':break;
               case'message_delta':
-                if(ev.usage)outTok=ev.usage.output_tokens||0;
+                if(ev.usage)localOut=ev.usage.output_tokens||0;
+                if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
                 break;
               case'error':throw new Error(ev.error?.message||'Stream error');
             }
-          }catch(pe){if(pe.message==='Stream error')throw pe}
+          }catch(pe){if(pe.message==='Stream error'||pe.message.includes('Stream'))throw pe}
         }
       }
     } else {
+      /* Non-streaming fallback */
       const data=await res.json();
       if(data.content&&Array.isArray(data.content)){
-        for(const b of data.content){if(b.type==='thinking')thinkTxt+=b.thinking;else if(b.type==='text')replyTxt+=b.text}
+        for(const b of data.content){
+          if(b.type==='thinking')thinkTxt+=b.thinking;
+          else if(b.type==='text')replyTxt+=b.text;
+        }
       }
-      if(data.usage){inTok=data.usage.input_tokens||0;outTok=data.usage.output_tokens||0;if(data.usage.cache_read_input_tokens)usage.cache_read=data.usage.cache_read_input_tokens}
+      /* Update UI for non-streaming */
+      updStreamText(el,replyTxt);
+      if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
+
+      if(data.usage){
+        localIn=data.usage.input_tokens||0;
+        localOut=data.usage.output_tokens||0;
+        if(data.usage.cache_read_input_tokens)localCache=data.usage.cache_read_input_tokens;
+      }
+      localStop=data.stop_reason||'';
+    }
+
+    return{inTok:localIn,outTok:localOut,cacheRead:localCache,stopReason:localStop};
+  }
+
+  try{
+    /* ── Initial request ── */
+    let result=await doRequest(c.history);
+    totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
+
+    /* ── Auto-continue loop ── */
+    while(autoContEnabled&&result.stopReason==='max_tokens'&&contCount<MAX_CONT){
+      contCount++;
+
+      /* Show continuation indicator */
+      const ci=document.createElement('div');ci.className='cont-ind';
+      ci.innerHTML='<span class="pulse"></span> Auto-continuing… ('+contCount+'/'+MAX_CONT+')';
+      el.body.appendChild(ci);el.body.appendChild(el.cur);
+      scrollEnd();
+
+      /* Add separator for thinking on continuations */
+      if(thinkTxt&&isThink){
+        thinkTxt+='\n\n── Continuation '+contCount+' ──\n\n';
+        updStreamThink(el,thinkTxt);
+      }
+
+      /* Build continuation messages: original history + partial response + continue prompt */
+      const contMsgs=[
+        ...c.history,
+        {role:'assistant',content:replyTxt},
+        {role:'user',content:'Continue from where you left off. Do not repeat any content.'}
+      ];
+
+      try{
+        result=await doRequest(contMsgs);
+        totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
+      }catch(contErr){
+        /* If continuation fails, keep what we have so far */
+        const existCi=el.body.querySelector('.cont-ind');
+        if(existCi)existCi.remove();
+        break;
+      }
+
+      /* Remove continuation indicator (streaming updates already replaced body innerHTML) */
+      const existCi=el.body.querySelector('.cont-ind');
+      if(existCi)existCi.remove();
     }
 
     /* ── Finalize ── */
@@ -655,22 +728,34 @@ async function send(){
     el.cpBtn.style.display='';
     rawContentMap.set(el.row,replyTxt||'(empty response)');
 
-    usage.input_tokens=inTok;usage.output_tokens=outTok;
-    c.tokIn+=inTok;c.tokOut+=outTok;
-    if(inTok||outTok){
+    const usage={input_tokens:totalInTok,output_tokens:totalOutTok};
+    if(totalCacheRead)usage.cache_read=totalCacheRead;
+    c.tokIn+=totalInTok;c.tokOut+=totalOutTok;
+
+    if(totalInTok||totalOutTok){
       el.ft.style.display='';
-      el.ft.innerHTML='<span class="tk">↑ in <span class="n">'+inTok.toLocaleString()+'</span></span><span class="tk">↓ out <span class="n">'+outTok.toLocaleString()+'</span></span>';
-      if(usage.cache_read)el.ft.innerHTML+='<span class="tk">📦 cache <span class="n">'+usage.cache_read.toLocaleString()+'</span></span>';
+      el.ft.innerHTML='<span class="tk">↑ in <span class="n">'+totalInTok.toLocaleString()+'</span></span><span class="tk">↓ out <span class="n">'+totalOutTok.toLocaleString()+'</span></span>';
+      if(totalCacheRead)el.ft.innerHTML+='<span class="tk">📦 cache <span class="n">'+totalCacheRead.toLocaleString()+'</span></span>';
+      if(contCount>0)el.ft.innerHTML+='<span class="cont-badge">🔄 '+contCount+' continuation'+(contCount>1?'s':'')+'</span>';
     }
     updCost();
 
-    const aMsg={role:'assistant',content:replyTxt||'(empty response)',thinking:thinkTxt||null,usage,modelLabel:model?.label,ts:Date.now()};
+    const aMsg={role:'assistant',content:replyTxt||'(empty response)',thinking:thinkTxt||null,usage,modelLabel:model?.label,ts:Date.now(),continuations:contCount};
     c.msgs.push(aMsg);c.history.push({role:'assistant',content:replyTxt||''});
 
   }catch(err){
     el.cur.remove();el.tk.style.display='none';
-    el.body.innerHTML='<span class="err-text">Error: '+esc(err.message)+'</span>';
-    c.msgs.push({role:'assistant',content:'Error: '+err.message,isError:true,ts:Date.now()});
+    /* If we have partial content from a failed first request, still show it */
+    if(replyTxt){
+      el.body.innerHTML=renderMd(replyTxt)+'<p class="err-text" style="margin-top:12px">⚠ Error during response: '+esc(err.message)+'</p>';
+      rawContentMap.set(el.row,replyTxt);
+      el.cpBtn.style.display='';
+      c.msgs.push({role:'assistant',content:replyTxt,thinking:thinkTxt||null,modelLabel:model?.label,ts:Date.now(),usage:{input_tokens:totalInTok,output_tokens:totalOutTok}});
+      c.history.push({role:'assistant',content:replyTxt});
+    }else{
+      el.body.innerHTML='<span class="err-text">Error: '+esc(err.message)+'</span>';
+      c.msgs.push({role:'assistant',content:'Error: '+err.message,isError:true,ts:Date.now()});
+    }
   }
 
   updNav();save();
