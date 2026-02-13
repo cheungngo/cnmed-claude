@@ -67,8 +67,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .chat-w{display:flex;flex:1;overflow:hidden;position:relative}
 
 /* ═══ CHAT AREA ═══ */
-#chatArea{flex:1;overflow-y:auto;padding:20px 14px;display:flex;flex-direction:column;gap:6px;scroll-behavior:smooth}
-#chatArea::-webkit-scrollbar{width:5px}#chatArea::-webkit-scrollbar-track{background:0 0}#chatArea::-webkit-scrollbar-thumb{background:rgba(255,255,255,.07);border-radius:3px}
+#chatArea{flex:1;overflow-y:auto;padding:20px 14px;display:flex;flex-direction:column;gap:6px;scroll-behavior:smooth;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.18) rgba(255,255,255,.04)}
+#chatArea::-webkit-scrollbar{width:8px}
+#chatArea::-webkit-scrollbar-track{background:rgba(255,255,255,.03);border-radius:4px}
+#chatArea::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:4px;border:1px solid rgba(255,255,255,.04)}
+#chatArea::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3)}
 
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;text-align:center;gap:12px;color:var(--tx3);padding:40px}
 .empty-ic{width:52px;height:52px;background:var(--sf2);border:1px solid var(--bdr);border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px}
@@ -107,8 +110,11 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .think.open .think-ch{transform:rotate(90deg)}
 .think-bd{overflow:hidden;transition:max-height .35s cubic-bezier(.4,0,.2,1),opacity .3s;max-height:0;opacity:0}
 .think.open .think-bd{max-height:800px;opacity:1}
-.think-tx{padding:0 14px 14px;font-size:12px;color:var(--tx3);white-space:pre-wrap;line-height:1.65;max-height:500px;overflow-y:auto;border-top:1px solid rgba(139,124,246,.1);padding-top:12px;margin:0 2px;font-family:'JetBrains Mono','SF Mono',monospace}
-.think-tx::-webkit-scrollbar{width:3px}.think-tx::-webkit-scrollbar-thumb{background:rgba(139,124,246,.18);border-radius:2px}
+.think-tx{padding:0 14px 14px;font-size:12px;color:var(--tx3);white-space:pre-wrap;line-height:1.65;max-height:500px;overflow-y:auto;border-top:1px solid rgba(139,124,246,.1);padding-top:12px;margin:0 2px;font-family:'JetBrains Mono','SF Mono',monospace;scrollbar-width:thin;scrollbar-color:rgba(139,124,246,.3) rgba(139,124,246,.06)}
+.think-tx::-webkit-scrollbar{width:6px}
+.think-tx::-webkit-scrollbar-track{background:rgba(139,124,246,.06);border-radius:3px}
+.think-tx::-webkit-scrollbar-thumb{background:rgba(139,124,246,.3);border-radius:3px}
+.think-tx::-webkit-scrollbar-thumb:hover{background:rgba(139,124,246,.5)}
 
 /* ═══ MARKDOWN ═══ */
 .md h1{font-size:1.4em;font-weight:700;margin:16px 0 8px;color:var(--tx);border-bottom:1px solid var(--bdr);padding-bottom:6px}
@@ -678,16 +684,13 @@ function mkStreamEl(model){
          ttx:tk.querySelector('.think-tx'),tmt:tk.querySelector('.think-mt'),tlb:tk.querySelector('.think-lb')};
 }
 
-/* ═══ THROTTLED STREAM RENDERING (perf fix) ═══
- * Instead of rendering Markdown on every delta (~60fps via rAF),
- * we dynamically throttle based on accumulated text length:
+/* ═══ THROTTLED STREAM RENDERING — TEXT (perf fix) ═══
+ * Dynamically throttle based on accumulated text length:
  *   < 2k chars  → render every 150ms  (feels instant)
  *   < 10k chars → every 300ms
  *   < 30k chars → every 600ms
  *   < 60k chars → every 1000ms
  *   60k+ chars  → every 2000ms
- * This eliminates the exponential cost of repeated regex-heavy
- * parsing on long/continued responses.
  */
 let mdTimer=null;
 let lastRenderTime=0;
@@ -739,9 +742,63 @@ function flushMd(el,txt){
   if(nearBot())scrollEnd();
 }
 
-function updStreamThink(el,txt){
+/* ═══ THROTTLED STREAM RENDERING — THINKING (perf fix) ═══
+ * Same dynamic throttle pattern for thinking text.
+ * The word-count split on every delta is expensive for
+ * long thinking blocks (100k+ chars), so we throttle
+ * the textContent + word count update together.
+ *   < 5k chars  → render every 200ms
+ *   < 20k chars → every 400ms
+ *   < 50k chars → every 800ms
+ *   < 100k chars → every 1500ms
+ *   100k+ chars → every 2500ms
+ */
+let thinkTimer=null;
+let lastThinkRenderTime=0;
+let _pendingThinkEl=null;
+let _pendingThinkTxt='';
+
+function _getThinkThrottleMs(){
+  const len=_pendingThinkTxt.length;
+  if(len<5000)return 200;
+  if(len<20000)return 400;
+  if(len<50000)return 800;
+  if(len<100000)return 1500;
+  return 2500;
+}
+
+function _doThinkRender(){
+  if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+  lastThinkRenderTime=Date.now();
+  if(!_pendingThinkEl)return;
+  const el=_pendingThinkEl;
+  const txt=_pendingThinkTxt;
   el.ttx.textContent=txt;
-  el.tmt.textContent=txt.trim().split(/\s+/).filter(Boolean).length+' words';
+  el.tmt.textContent=txt.trim().split(/\s+/).filter(Boolean).length.toLocaleString()+' words';
+  el.ttx.scrollTop=el.ttx.scrollHeight;
+  if(nearBot())scrollEnd();
+}
+
+function updStreamThink(el,txt){
+  _pendingThinkEl=el;
+  _pendingThinkTxt=txt;
+  const throttle=_getThinkThrottleMs();
+  const now=Date.now();
+  const elapsed=now-lastThinkRenderTime;
+  if(elapsed>=throttle){
+    _doThinkRender();
+  }else if(!thinkTimer){
+    thinkTimer=setTimeout(_doThinkRender,throttle-elapsed);
+  }
+}
+
+function flushThink(el,txt){
+  if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+  lastThinkRenderTime=0;
+  _pendingThinkEl=null;
+  _pendingThinkTxt='';
+  el.ttx.textContent=txt;
+  el.tmt.textContent=txt.trim().split(/\s+/).filter(Boolean).length.toLocaleString()+' words';
   el.ttx.scrollTop=el.ttx.scrollHeight;
   if(nearBot())scrollEnd();
 }
@@ -774,6 +831,7 @@ async function send(){
 
   /* Reset render throttle state for new stream */
   lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+  lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
   const sendStartTime=Date.now();
 
@@ -894,7 +952,7 @@ async function send(){
           if(data.usage.cache_read_input_tokens)localCache=data.usage.cache_read_input_tokens;
         }
         localStop=data.stop_reason||'';
-        if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
+        if(thinkTxt){el.tk.style.display='';flushThink(el,thinkTxt)}
       }
 
       flushMd(el,replyTxt);
@@ -968,7 +1026,7 @@ async function send(){
 
       if(thinkTxt&&isThink){
         thinkTxt+='\n\n─── Continuation '+contCount+' ───\n\n';
-        updStreamThink(el,thinkTxt);
+        flushThink(el,thinkTxt);
       }
 
       /* Build continuation messages — handle empty replyTxt (thinking cutoff) */
@@ -987,6 +1045,7 @@ async function send(){
 
       /* Reset throttle for continuation stream */
       lastRenderTime=0;
+      lastThinkRenderTime=0;
 
       const textBefore=replyTxt.length;
       const thinkBefore=thinkTxt.length;
@@ -1012,9 +1071,11 @@ async function send(){
     /* ── Finalize ── */
     if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
     lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+    if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+    lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     el.cur.remove();
     el.contStatus.style.display='none';
-    if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
+    if(thinkTxt){el.tlb.textContent='Thinking Process';flushThink(el,thinkTxt)}else{el.tk.style.display='none'}
     el.body.style.whiteSpace='';
     el.body.innerHTML=renderMd(replyTxt||'(empty response)');
 
@@ -1051,6 +1112,8 @@ async function send(){
   }catch(err){
     if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
     lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+    if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+    lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     el.cur.remove();el.tk.style.display='none';el.contStatus.style.display='none';
     if(replyTxt){
       el.body.style.whiteSpace='';
@@ -1109,6 +1172,7 @@ async function manualContinue(){
 
   /* Reset throttle state for new stream */
   lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+  lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
   contCount++;
   el.contStatus.style.display='';
@@ -1117,7 +1181,7 @@ async function manualContinue(){
 
   if(thinkTxt&&isThink){
     thinkTxt+='\n\n─── Continuation '+contCount+' ───\n\n';
-    updStreamThink(el,thinkTxt);
+    flushThink(el,thinkTxt);
   }
 
   if(c.history.length&&c.history[c.history.length-1].role==='assistant'){
@@ -1214,12 +1278,16 @@ async function manualContinue(){
 
     if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
     lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+    if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+    lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
     totalInTok+=localIn;totalOutTok+=localOut;totalCacheRead+=localCache;
 
   }catch(err){
     if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
     lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+    if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
+    lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     console.warn('[manual-continue] Error:',err.message);
     el.contStatus.style.display='';
     el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Continue failed: '+esc(err.message)+'</div>';
@@ -1231,7 +1299,7 @@ async function manualContinue(){
   if(!el.contStatus.querySelector('[style*="red"]')){
     el.contStatus.style.display='none';
   }
-  if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
+  if(thinkTxt){el.tlb.textContent='Thinking Process';flushThink(el,thinkTxt)}else{el.tk.style.display='none'}
   el.body.style.whiteSpace='';
   el.body.innerHTML=renderMd(replyTxt||'(empty response)');
   el.cpBtn.style.display='';
