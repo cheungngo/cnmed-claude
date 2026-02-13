@@ -861,7 +861,7 @@ async function send(){
   async function doRequest(messages){
     let localIn=0,localOut=0,localCache=0,localStop='';
 
-    const reqBody={model:modelId,max_tokens:1280000,messages:messages,stream:true};
+    const reqBody={model:modelId,max_tokens:128000,messages:messages,stream:true};
     if(isThink)reqBody.thinking={type:'enabled',budget_tokens:100000};
 
     console.log('[auto-continue] Sending request, messages:',messages.length,'continuation:',contCount);
@@ -1351,3 +1351,4 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
+
