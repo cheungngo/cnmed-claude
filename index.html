@@ -663,6 +663,7 @@ function mkStreamEl(model){
   msg.appendChild(tk);
 
   const body=document.createElement('div');body.className='msg-body md';
+  body.style.whiteSpace='pre-wrap';
   const cur=document.createElement('span');cur.className='cursor';body.appendChild(cur);
   msg.appendChild(body);
 
@@ -677,20 +678,67 @@ function mkStreamEl(model){
          ttx:tk.querySelector('.think-tx'),tmt:tk.querySelector('.think-mt'),tlb:tk.querySelector('.think-lb')};
 }
 
+/* ═══ THROTTLED STREAM RENDERING (perf fix) ═══
+ * Instead of rendering Markdown on every delta (~60fps via rAF),
+ * we dynamically throttle based on accumulated text length:
+ *   < 2k chars  → render every 150ms  (feels instant)
+ *   < 10k chars → every 300ms
+ *   < 30k chars → every 600ms
+ *   < 60k chars → every 1000ms
+ *   60k+ chars  → every 2000ms
+ * This eliminates the exponential cost of repeated regex-heavy
+ * parsing on long/continued responses.
+ */
 let mdTimer=null;
-function flushMd(el,txt){
-  if(mdTimer){cancelAnimationFrame(mdTimer);mdTimer=null}
-  el.body.innerHTML=renderMd(txt);el.body.appendChild(el.cur);
+let lastRenderTime=0;
+let _pendingEl=null;
+let _pendingTxt='';
+
+function _getThrottleMs(){
+  const len=_pendingTxt.length;
+  if(len<2000)return 150;
+  if(len<10000)return 300;
+  if(len<30000)return 600;
+  if(len<60000)return 1000;
+  return 2000;
+}
+
+function _doStreamRender(){
+  if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+  lastRenderTime=Date.now();
+  if(!_pendingEl)return;
+  const el=_pendingEl;
+  const txt=_pendingTxt;
+  el.body.style.whiteSpace='';
+  el.body.innerHTML=renderMd(txt);
+  el.body.appendChild(el.cur);
   if(nearBot())scrollEnd();
 }
+
 function updStreamText(el,txt){
-  if(mdTimer)return;
-  mdTimer=requestAnimationFrame(()=>{
-    el.body.innerHTML=renderMd(txt);el.body.appendChild(el.cur);
-    if(nearBot())scrollEnd();
-    mdTimer=null;
-  });
+  _pendingEl=el;
+  _pendingTxt=txt;
+  const throttle=_getThrottleMs();
+  const now=Date.now();
+  const elapsed=now-lastRenderTime;
+  if(elapsed>=throttle){
+    _doStreamRender();
+  }else if(!mdTimer){
+    mdTimer=setTimeout(_doStreamRender,throttle-elapsed);
+  }
 }
+
+function flushMd(el,txt){
+  if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+  lastRenderTime=0;
+  _pendingEl=null;
+  _pendingTxt='';
+  el.body.style.whiteSpace='';
+  el.body.innerHTML=renderMd(txt);
+  el.body.appendChild(el.cur);
+  if(nearBot())scrollEnd();
+}
+
 function updStreamThink(el,txt){
   el.ttx.textContent=txt;
   el.tmt.textContent=txt.trim().split(/\s+/).filter(Boolean).length+' words';
@@ -723,6 +771,9 @@ async function send(){
 
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
+
+  /* Reset render throttle state for new stream */
+  lastRenderTime=0;_pendingEl=null;_pendingTxt='';
 
   const sendStartTime=Date.now();
 
@@ -934,6 +985,9 @@ async function send(){
       }
       trimHistory(contMsgs);
 
+      /* Reset throttle for continuation stream */
+      lastRenderTime=0;
+
       const textBefore=replyTxt.length;
       const thinkBefore=thinkTxt.length;
       try{
@@ -956,9 +1010,12 @@ async function send(){
     }
 
     /* ── Finalize ── */
+    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     el.cur.remove();
     el.contStatus.style.display='none';
     if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
+    el.body.style.whiteSpace='';
     el.body.innerHTML=renderMd(replyTxt||'(empty response)');
 
     el.cpBtn.style.display='';
@@ -992,14 +1049,18 @@ async function send(){
     c.msgs.push(aMsg);c.history.push({role:'assistant',content:replyTxt||''});
 
   }catch(err){
+    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     el.cur.remove();el.tk.style.display='none';el.contStatus.style.display='none';
     if(replyTxt){
+      el.body.style.whiteSpace='';
       el.body.innerHTML=renderMd(replyTxt)+'<p class="err-text" style="margin-top:12px">⚠ Error: '+esc(err.message)+'</p>';
       rawContentMap.set(el.row,replyTxt);
       el.cpBtn.style.display='';
       c.msgs.push({role:'assistant',content:replyTxt,thinking:thinkTxt||null,modelLabel:model?.label,ts:Date.now(),usage:{input_tokens:totalInTok,output_tokens:totalOutTok}});
       c.history.push({role:'assistant',content:replyTxt});
     }else{
+      el.body.style.whiteSpace='';
       el.body.innerHTML='<span class="err-text">Error: '+esc(err.message)+'</span>';
       c.msgs.push({role:'assistant',content:'Error: '+err.message,isError:true,ts:Date.now()});
     }
@@ -1042,8 +1103,12 @@ async function manualContinue(){
   const oldBtn=el.ft.querySelector('.cont-btn');if(oldBtn)oldBtn.remove();
 
   const cur=document.createElement('span');cur.className='cursor';
+  el.body.style.whiteSpace='pre-wrap';
   el.body.appendChild(cur);
   el.cur=cur;
+
+  /* Reset throttle state for new stream */
+  lastRenderTime=0;_pendingEl=null;_pendingTxt='';
 
   contCount++;
   el.contStatus.style.display='';
@@ -1147,11 +1212,14 @@ async function manualContinue(){
       localStop=data.stop_reason||'';
     }
 
-    if(mdTimer){cancelAnimationFrame(mdTimer);mdTimer=null}
+    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
 
     totalInTok+=localIn;totalOutTok+=localOut;totalCacheRead+=localCache;
 
   }catch(err){
+    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
+    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     console.warn('[manual-continue] Error:',err.message);
     el.contStatus.style.display='';
     el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Continue failed: '+esc(err.message)+'</div>';
@@ -1164,6 +1232,7 @@ async function manualContinue(){
     el.contStatus.style.display='none';
   }
   if(thinkTxt){el.tlb.textContent='Thinking Process';updStreamThink(el,thinkTxt)}else{el.tk.style.display='none'}
+  el.body.style.whiteSpace='';
   el.body.innerHTML=renderMd(replyTxt||'(empty response)');
   el.cpBtn.style.display='';
   rawContentMap.set(el.row,replyTxt||'(empty response)');
@@ -1214,9 +1283,3 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
-
-
-
-
-
-
