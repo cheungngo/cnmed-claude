@@ -294,11 +294,11 @@ const MAX_CONT=50;
 const FETCH_TIMEOUT_MS=8000;
 const MAX_RETRIES=3;
 const RETRY_BASE_MS=10000;
-const CONT_DELAY_MS=10000;            /* cooldown before auto-continue */
+const CONT_DELAY_MS=10000;
 const MAX_HISTORY_CHARS=8000000;
 const STREAM_STALL_MS=45000;
 const STALL_WARN_MS=30000;
-const OVERALL_TIMEOUT_MS=10000000;     /* cont. working total time */
+const OVERALL_TIMEOUT_MS=10000000;
 
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
@@ -536,7 +536,6 @@ function showNavTip(e){
   tip.style.top=(rect.top+rect.height/2)+'px';
   tip.style.transform='translateY(-50%)';
   tip.classList.add('vis');
-  /* Clamp to viewport after render */
   requestAnimationFrame(()=>{
     const tr=tip.getBoundingClientRect();
     if(tr.top<8){tip.style.top='8px';tip.style.transform='none'}
@@ -613,7 +612,6 @@ function appendEl(data,idx,anim=true){
   hdr.appendChild(av);hdr.appendChild(nm);
   if(data.modelLabel){const ml=document.createElement('span');ml.className='msg-ml';ml.textContent='· '+data.modelLabel;hdr.appendChild(ml)}
   if(data.ts){const t=document.createElement('span');t.className='msg-tm';t.textContent=fmtT(data.ts);hdr.appendChild(t)}
-  /* Copy button for BOTH user and assistant (non-error) messages */
   if(!data.isError){
     const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.onclick=function(){cpResp(this)};
     hdr.appendChild(cpBtn);
@@ -646,7 +644,6 @@ function appendEl(data,idx,anim=true){
     msg.appendChild(ft);
   }
   row.appendChild(msg);chatArea.appendChild(row);
-  /* Store raw content for copy — both roles */
   if(!data.isError){rawContentMap.set(row,data.content||'')}
 }
 
@@ -668,7 +665,8 @@ function mkStreamEl(model){
   tk.querySelector('.think-hd').onclick=()=>tk.classList.toggle('open');
   msg.appendChild(tk);
 
-  const body=document.createElement('div');body.className='msg-body md';
+  /* Body starts as raw text (no 'md' class) for fast streaming */
+  const body=document.createElement('div');body.className='msg-body';
   body.style.whiteSpace='pre-wrap';
   const cur=document.createElement('span');cur.className='cursor';body.appendChild(cur);
   msg.appendChild(body);
@@ -684,69 +682,28 @@ function mkStreamEl(model){
          ttx:tk.querySelector('.think-tx'),tmt:tk.querySelector('.think-mt'),tlb:tk.querySelector('.think-lb')};
 }
 
-/* ═══ THROTTLED STREAM RENDERING — TEXT (perf fix) ═══
- * Dynamically throttle based on accumulated text length:
- *   < 2k chars  → render every 150ms  (feels instant)
- *   < 10k chars → every 300ms
- *   < 30k chars → every 600ms
- *   < 60k chars → every 1000ms
- *   60k+ chars  → every 2000ms
+/* ═══ RAW TEXT STREAMING + FINAL MARKDOWN ═══
+ * Stream as plain text (textContent is instant, zero parsing).
+ * Render Markdown only once when each segment completes.
  */
-let mdTimer=null;
-let lastRenderTime=0;
-let _pendingEl=null;
-let _pendingTxt='';
-
-function _getThrottleMs(){
-  const len=_pendingTxt.length;
-  if(len<2000)return 150;
-  if(len<10000)return 300;
-  if(len<30000)return 600;
-  if(len<60000)return 1000;
-  return 2000;
-}
-
-function _doStreamRender(){
-  if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-  lastRenderTime=Date.now();
-  if(!_pendingEl)return;
-  const el=_pendingEl;
-  const txt=_pendingTxt;
-  el.body.style.whiteSpace='';
-  el.body.innerHTML=renderMd(txt);
+function updateRawText(el,txt){
+  el.body.classList.remove('md');
+  el.body.style.whiteSpace='pre-wrap';
+  el.cur.remove();
+  el.body.textContent=txt;
   el.body.appendChild(el.cur);
   if(nearBot())scrollEnd();
 }
 
-function updStreamText(el,txt){
-  _pendingEl=el;
-  _pendingTxt=txt;
-  const throttle=_getThrottleMs();
-  const now=Date.now();
-  const elapsed=now-lastRenderTime;
-  if(elapsed>=throttle){
-    _doStreamRender();
-  }else if(!mdTimer){
-    mdTimer=setTimeout(_doStreamRender,throttle-elapsed);
-  }
-}
-
-function flushMd(el,txt){
-  if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-  lastRenderTime=0;
-  _pendingEl=null;
-  _pendingTxt='';
+function finalizeMd(el,txt){
+  el.body.classList.add('md');
   el.body.style.whiteSpace='';
-  el.body.innerHTML=renderMd(txt);
-  el.body.appendChild(el.cur);
+  el.body.innerHTML=renderMd(txt||'(empty response)');
   if(nearBot())scrollEnd();
 }
 
 /* ═══ THROTTLED STREAM RENDERING — THINKING (perf fix) ═══
- * Same dynamic throttle pattern for thinking text.
- * The word-count split on every delta is expensive for
- * long thinking blocks (100k+ chars), so we throttle
- * the textContent + word count update together.
+ * textContent is fast, but word-count split on large text adds up.
  *   < 5k chars  → render every 200ms
  *   < 20k chars → every 400ms
  *   < 50k chars → every 800ms
@@ -829,8 +786,7 @@ async function send(){
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
 
-  /* Reset render throttle state for new stream */
-  lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+  /* Reset thinking throttle state for new stream */
   lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
   const sendStartTime=Date.now();
@@ -911,7 +867,7 @@ async function send(){
                     break;
                   case'content_block_delta':
                     if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
-                    else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
+                    else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updateRawText(el,replyTxt)}
                     break;
                   case'content_block_stop':break;
                   case'message_delta':
@@ -955,13 +911,14 @@ async function send(){
         if(thinkTxt){el.tk.style.display='';flushThink(el,thinkTxt)}
       }
 
-      flushMd(el,replyTxt);
+      /* Render markdown once at end of this segment, keep cursor for potential continuation */
+      finalizeMd(el,replyTxt);
+      el.body.appendChild(el.cur);
 
       if(!localStop&&replyTxt.length>200&&looksIncomplete(replyTxt)){
         console.log('[auto-continue] No stop_reason but heuristic detected truncation');
         localStop='max_tokens';
       }
-      /* Heuristic: thinking was cut off (substantial thinking, little/no reply) */
       if(!localStop&&thinkTxt.length>1000&&replyTxt.length<50){
         console.log('[auto-continue] No stop_reason but thinking cut off heuristic triggered');
         localStop='max_tokens';
@@ -990,7 +947,6 @@ async function send(){
         break;
       }
 
-      /* shouldContinue: covers both reply truncation AND thinking truncation */
       const shouldContinue=result.stopReason==='max_tokens'||
         (!result.stopReason&&replyTxt.length>500&&looksIncomplete(replyTxt))||
         (!result.stopReason&&thinkTxt.length>1000&&replyTxt.length<50);
@@ -1004,7 +960,6 @@ async function send(){
       contCount++;
       console.log('[auto-continue] Starting continuation',contCount,'/',MAX_CONT);
 
-      /* ── 1-minute cooldown with countdown ── */
       el.contStatus.style.display='';
       const cdSec=Math.ceil(CONT_DELAY_MS/1000);
       let cdRem=cdSec;
@@ -1029,7 +984,6 @@ async function send(){
         flushThink(el,thinkTxt);
       }
 
-      /* Build continuation messages — handle empty replyTxt (thinking cutoff) */
       let contMsgs;
       if(replyTxt.trim()){
         contMsgs=[
@@ -1038,13 +992,11 @@ async function send(){
           {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
         ];
       } else {
-        /* Thinking was cut off before any reply text — retry original messages */
         contMsgs=[...c.history];
       }
       trimHistory(contMsgs);
 
-      /* Reset throttle for continuation stream */
-      lastRenderTime=0;
+      /* Reset thinking throttle for continuation stream */
       lastThinkRenderTime=0;
 
       const textBefore=replyTxt.length;
@@ -1061,7 +1013,6 @@ async function send(){
 
       el.contStatus.style.display='none';
 
-      /* Progress check: consider both reply text AND thinking text growth */
       if(replyTxt.length<=textBefore&&thinkTxt.length<=thinkBefore){
         console.log('[auto-continue] No new content in continuation, stopping');
         break;
@@ -1069,15 +1020,12 @@ async function send(){
     }
 
     /* ── Finalize ── */
-    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
     lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     el.cur.remove();
     el.contStatus.style.display='none';
     if(thinkTxt){el.tlb.textContent='Thinking Process';flushThink(el,thinkTxt)}else{el.tk.style.display='none'}
-    el.body.style.whiteSpace='';
-    el.body.innerHTML=renderMd(replyTxt||'(empty response)');
+    finalizeMd(el,replyTxt);
 
     el.cpBtn.style.display='';
     rawContentMap.set(el.row,replyTxt||'(empty response)');
@@ -1110,19 +1058,18 @@ async function send(){
     c.msgs.push(aMsg);c.history.push({role:'assistant',content:replyTxt||''});
 
   }catch(err){
-    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
     lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     el.cur.remove();el.tk.style.display='none';el.contStatus.style.display='none';
     if(replyTxt){
-      el.body.style.whiteSpace='';
-      el.body.innerHTML=renderMd(replyTxt)+'<p class="err-text" style="margin-top:12px">⚠ Error: '+esc(err.message)+'</p>';
+      finalizeMd(el,replyTxt);
+      el.body.innerHTML+='<p class="err-text" style="margin-top:12px">⚠ Error: '+esc(err.message)+'</p>';
       rawContentMap.set(el.row,replyTxt);
       el.cpBtn.style.display='';
       c.msgs.push({role:'assistant',content:replyTxt,thinking:thinkTxt||null,modelLabel:model?.label,ts:Date.now(),usage:{input_tokens:totalInTok,output_tokens:totalOutTok}});
       c.history.push({role:'assistant',content:replyTxt});
     }else{
+      el.body.classList.remove('md');
       el.body.style.whiteSpace='';
       el.body.innerHTML='<span class="err-text">Error: '+esc(err.message)+'</span>';
       c.msgs.push({role:'assistant',content:'Error: '+err.message,isError:true,ts:Date.now()});
@@ -1170,8 +1117,7 @@ async function manualContinue(){
   el.body.appendChild(cur);
   el.cur=cur;
 
-  /* Reset throttle state for new stream */
-  lastRenderTime=0;_pendingEl=null;_pendingTxt='';
+  /* Reset thinking throttle state for new stream */
   lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
   contCount++;
@@ -1191,7 +1137,6 @@ async function manualContinue(){
     c.msgs.pop();
   }
 
-  /* Build continuation messages — handle empty replyTxt */
   let contMsgs;
   if(replyTxt.trim()){
     contMsgs=[
@@ -1243,7 +1188,7 @@ async function manualContinue(){
                 case'content_block_start':if(ev.content_block?.type==='thinking')el.tk.style.display='';break;
                 case'content_block_delta':
                   if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
-                  else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
+                  else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updateRawText(el,replyTxt)}
                   break;
                 case'message_delta':
                   if(ev.usage)localOut=ev.usage.output_tokens||0;
@@ -1276,16 +1221,12 @@ async function manualContinue(){
       localStop=data.stop_reason||'';
     }
 
-    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
     lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
 
     totalInTok+=localIn;totalOutTok+=localOut;totalCacheRead+=localCache;
 
   }catch(err){
-    if(mdTimer){clearTimeout(mdTimer);mdTimer=null}
-    lastRenderTime=0;_pendingEl=null;_pendingTxt='';
     if(thinkTimer){clearTimeout(thinkTimer);thinkTimer=null}
     lastThinkRenderTime=0;_pendingThinkEl=null;_pendingThinkTxt='';
     console.warn('[manual-continue] Error:',err.message);
@@ -1300,8 +1241,7 @@ async function manualContinue(){
     el.contStatus.style.display='none';
   }
   if(thinkTxt){el.tlb.textContent='Thinking Process';flushThink(el,thinkTxt)}else{el.tk.style.display='none'}
-  el.body.style.whiteSpace='';
-  el.body.innerHTML=renderMd(replyTxt||'(empty response)');
+  finalizeMd(el,replyTxt);
   el.cpBtn.style.display='';
   rawContentMap.set(el.row,replyTxt||'(empty response)');
 
@@ -1351,4 +1291,3 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
-
