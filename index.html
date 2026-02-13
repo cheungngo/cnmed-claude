@@ -64,7 +64,7 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .ac-toggle:hover{color:var(--tx)}
 
 /* ═══ CHAT WRAPPER ═══ */
-.chat-w{display:flex;flex:1;overflow:hidden}
+.chat-w{display:flex;flex:1;overflow:hidden;position:relative}
 
 /* ═══ CHAT AREA ═══ */
 #chatArea{flex:1;overflow-y:auto;padding:20px 14px;display:flex;flex-direction:column;gap:6px;scroll-behavior:smooth}
@@ -171,9 +171,13 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
 .nr-dot.a{background:#f59e0b;opacity:.35}
 .nr-dot.act{opacity:1;transform:scale(1.5);box-shadow:0 0 8px rgba(139,124,246,.3)}
 .nr-dot:hover{opacity:.8;transform:scale(1.3)}
-.nr-tip{position:absolute;right:28px;top:50%;transform:translateY(-50%);background:var(--sf3);border:1px solid var(--bdr2);padding:4px 9px;border-radius:6px;font-size:10px;color:var(--tx2);white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis;opacity:0;pointer-events:none;transition:opacity .15s;z-index:50}
-.nr-dot:hover .nr-tip{opacity:1}
 .nr-empty{writing-mode:vertical-rl;font-size:9px;color:var(--tx3);letter-spacing:1px;text-transform:uppercase;opacity:.5;user-select:none}
+
+/* ═══ NAV TOOLTIP (fixed position, escapes overflow) ═══ */
+.nav-tooltip{position:fixed;background:var(--sf2);border:1px solid var(--bdr2);padding:10px 14px;border-radius:10px;font-size:11px;color:var(--tx2);max-width:300px;max-height:160px;overflow:hidden;pointer-events:none;opacity:0;transition:opacity .15s;z-index:200;line-height:1.55;box-shadow:0 8px 30px rgba(0,0,0,.5);word-break:break-word}
+.nav-tooltip.vis{opacity:1}
+.nav-tooltip .nt-role{font-weight:600;font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+.nav-tooltip .nt-text{color:var(--tx2);white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden}
 
 /* ═══ INPUT ═══ */
 #inpArea{padding:12px 18px;border-top:1px solid var(--bdr);background:var(--sf)}
@@ -240,6 +244,7 @@ html,body{height:100%;font-family:'Inter',-apple-system,sans-serif;background:va
         <div class="nr-trk"></div>
         <div class="nr-inner" id="nrDots"></div>
       </div>
+      <div class="nav-tooltip" id="navTip"></div>
     </div>
     <div id="inpArea">
       <div class="inp-r">
@@ -277,17 +282,17 @@ const MODELS=[
 {id:"ggg-5-codex-high",label:"GGG-5 Codex High",pi:.939,po:7.512,tier:"other"},
 ];
 const TIERS={opus:"Opus",sonnet:"Sonnet",haiku:"Haiku",other:"Other"};
-const MAX_CONT=8;
+const MAX_CONT=30;
 
 /* ═══ ROBUSTNESS CONSTANTS ═══ */
-const FETCH_TIMEOUT_MS=180000;       /* 3 min per fetch (headers) */
-const MAX_RETRIES=2;                 /* retries on 429/529/network */
-const RETRY_BASE_MS=3000;            /* 3s base backoff */
-const CONT_DELAY_MS=1500;            /* pause between auto-continues */
-const MAX_HISTORY_CHARS=800000;      /* ~800 KB rough payload guard */
-const STREAM_STALL_MS=45000;         /* 45s no stream data → abort reader */
-const STALL_WARN_MS=30000;           /* 30s → show "taking longer" warning */
-const OVERALL_TIMEOUT_MS=300000;     /* 5 min overall send timeout */
+const FETCH_TIMEOUT_MS=180000;
+const MAX_RETRIES=2;
+const RETRY_BASE_MS=3000;
+const CONT_DELAY_MS=60000;            /* 1-min cooldown before auto-continue */
+const MAX_HISTORY_CHARS=800000;
+const STREAM_STALL_MS=45000;
+const STALL_WARN_MS=30000;
+const OVERALL_TIMEOUT_MS=300000;
 
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
@@ -299,7 +304,6 @@ const chatArea=$('chatArea'),uInp=$('uInp'),sendBtn=$('sendBtn'),
 /* ═══ STATE ═══ */
 let chats=[],curId=null,sending=false;
 const rawContentMap=new WeakMap();
-/* State for manual continue */
 let lastContState=null;
 function gc(id){return chats.find(c=>c.id===(id||curId))}
 function cc(){return gc(curId)}
@@ -360,10 +364,8 @@ function fmtT(ts){return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minu
 /* ═══ HEURISTIC: detect truncated response ═══ */
 function looksIncomplete(text){
   if(!text||text.length<200)return false;
-  /* Unclosed code fence — strongest signal */
   const fences=(text.match(/```/g)||[]).length;
   if(fences%2!==0)return true;
-  /* Ends mid-word / comma after substantial content */
   const t=text.trimEnd();
   if(t.length>800){
     const last=t.slice(-1);
@@ -372,7 +374,7 @@ function looksIncomplete(text){
   return false;
 }
 
-/* ═══ HISTORY TRIMMING — prevents context overflow ═══ */
+/* ═══ HISTORY TRIMMING ═══ */
 function trimHistory(history){
   let safety=0;
   while(history.length>2&&JSON.stringify(history).length>MAX_HISTORY_CHARS&&safety<200){
@@ -480,7 +482,7 @@ function cpCode(btn){
   });
 }
 
-/* ═══ COPY RESPONSE ═══ */
+/* ═══ COPY MESSAGE (works for both user & assistant) ═══ */
 function cpResp(btn){
   const row=btn.closest('.msg-row');
   const raw=rawContentMap.get(row);
@@ -514,6 +516,29 @@ function renderSB(){
 }
 
 /* ═══ NAV RAIL ═══ */
+function showNavTip(e){
+  const dot=e.currentTarget;
+  const tip=$('navTip');
+  const rect=dot.getBoundingClientRect();
+  const role=dot.dataset.role;
+  const pv=dot.dataset.pv||'';
+  const roleLabel=role==='user'?'You':'Claude';
+  const roleColor=role==='user'?'#a78bfa':'#f59e0b';
+  tip.innerHTML='<div class="nt-role" style="color:'+roleColor+'">'+roleLabel+'</div><div class="nt-text">'+esc(pv)+'</div>';
+  tip.style.right=(window.innerWidth-rect.left+10)+'px';
+  tip.style.left='auto';
+  tip.style.top=(rect.top+rect.height/2)+'px';
+  tip.style.transform='translateY(-50%)';
+  tip.classList.add('vis');
+  /* Clamp to viewport after render */
+  requestAnimationFrame(()=>{
+    const tr=tip.getBoundingClientRect();
+    if(tr.top<8){tip.style.top='8px';tip.style.transform='none'}
+    else if(tr.bottom>window.innerHeight-8){tip.style.top=(window.innerHeight-8-tr.height)+'px';tip.style.transform='none'}
+  });
+}
+function hideNavTip(){$('navTip').classList.remove('vis')}
+
 function updNav(){
   nrDots.innerHTML='';
   const c=cc();
@@ -522,10 +547,11 @@ function updNav(){
     const dot=document.createElement('div');
     dot.className='nr-dot '+(m.role==='user'?'u':'a');
     dot.dataset.idx=idx;
-    const tip=document.createElement('div');tip.className='nr-tip';
-    const pv=(m.content||'').length>35?(m.content||'').slice(0,35)+'…':(m.content||'');
-    tip.textContent=(m.role==='user'?'⟡ ':'✦ ')+pv;
-    dot.appendChild(tip);
+    dot.dataset.role=m.role;
+    const pvLen=200;
+    dot.dataset.pv=(m.content||'').length>pvLen?(m.content||'').slice(0,pvLen)+'…':(m.content||'(empty)');
+    dot.addEventListener('mouseenter',showNavTip);
+    dot.addEventListener('mouseleave',hideNavTip);
     dot.onclick=()=>{const rows=chatArea.querySelectorAll('.msg-row');if(rows[idx])rows[idx].scrollIntoView({behavior:'smooth',block:'start'})};
     nrDots.appendChild(dot);
   });
@@ -581,7 +607,8 @@ function appendEl(data,idx,anim=true){
   hdr.appendChild(av);hdr.appendChild(nm);
   if(data.modelLabel){const ml=document.createElement('span');ml.className='msg-ml';ml.textContent='· '+data.modelLabel;hdr.appendChild(ml)}
   if(data.ts){const t=document.createElement('span');t.className='msg-tm';t.textContent=fmtT(data.ts);hdr.appendChild(t)}
-  if(data.role==='assistant'&&!data.isError){
+  /* Copy button for BOTH user and assistant (non-error) messages */
+  if(!data.isError){
     const cpBtn=document.createElement('button');cpBtn.className='cp-resp-btn';cpBtn.innerHTML='📋 Copy';cpBtn.onclick=function(){cpResp(this)};
     hdr.appendChild(cpBtn);
   }
@@ -613,7 +640,8 @@ function appendEl(data,idx,anim=true){
     msg.appendChild(ft);
   }
   row.appendChild(msg);chatArea.appendChild(row);
-  if(data.role==='assistant'&&!data.isError){rawContentMap.set(row,data.content||'')}
+  /* Store raw content for copy — both roles */
+  if(!data.isError){rawContentMap.set(row,data.content||'')}
 }
 
 /* ═══ STREAM HELPERS ═══ */
@@ -696,10 +724,8 @@ async function send(){
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
 
-  /* ── Overall timeout tracking ── */
   const sendStartTime=Date.now();
 
-  /* ── Stall warning (visual "Taking longer than usual…") ── */
   let stallWarnTimer=null;
   function startStallWarn(){
     clearTimeout(stallWarnTimer);
@@ -718,13 +744,11 @@ async function send(){
     }
   }
 
-  /* Accumulation across continuations */
   let thinkTxt='',replyTxt='';
   let totalInTok=0,totalOutTok=0,totalCacheRead=0;
   let contCount=0;
   const autoContEnabled=$('autoCont').checked;
 
-  /* ── doRequest: one streaming request, returns {inTok, outTok, cacheRead, stopReason} ── */
   async function doRequest(messages){
     let localIn=0,localOut=0,localCache=0,localStop='';
 
@@ -756,7 +780,7 @@ async function send(){
           while(true){
             const{done,value}=await readWithStallTimeout(reader,STREAM_STALL_MS);
             if(done)break;
-            startStallWarn(); /* reset visual stall warning on each chunk */
+            startStallWarn();
             buf+=dec.decode(value,{stream:true});
             while(true){
               const nl=buf.indexOf('\n');if(nl===-1)break;
@@ -797,8 +821,7 @@ async function send(){
             }
           }
         }catch(streamErr){
-          /* Stream stall with partial content → treat as max_tokens for auto-continue */
-          if(streamErr.message&&streamErr.message.includes('Stream stalled')&&replyTxt.length>200){
+          if(streamErr.message&&streamErr.message.includes('Stream stalled')&&(replyTxt.length>200||thinkTxt.length>200)){
             console.warn('[stream] Stall with partial content, treating as max_tokens');
             localStop='max_tokens';
           }else{
@@ -806,7 +829,6 @@ async function send(){
           }
         }
       } else {
-        /* Non-streaming JSON fallback */
         const data=await res.json();
         console.log('[auto-continue] Non-stream response, stop_reason:', data.stop_reason);
         if(data.content&&Array.isArray(data.content)){
@@ -824,16 +846,19 @@ async function send(){
         if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
       }
 
-      /* Force-flush any pending RAF so UI is up to date */
       flushMd(el,replyTxt);
 
-      /* Heuristic fallback: if no stop_reason but response looks truncated */
       if(!localStop&&replyTxt.length>200&&looksIncomplete(replyTxt)){
         console.log('[auto-continue] No stop_reason but heuristic detected truncation');
         localStop='max_tokens';
       }
+      /* Heuristic: thinking was cut off (substantial thinking, little/no reply) */
+      if(!localStop&&thinkTxt.length>1000&&replyTxt.length<50){
+        console.log('[auto-continue] No stop_reason but thinking cut off heuristic triggered');
+        localStop='max_tokens';
+      }
 
-      console.log('[auto-continue] Request done — stop:',localStop,'in:',localIn,'out:',localOut,'replyLen:',replyTxt.length);
+      console.log('[auto-continue] Request done — stop:',localStop,'in:',localIn,'out:',localOut,'replyLen:',replyTxt.length,'thinkLen:',thinkTxt.length);
       return{inTok:localIn,outTok:localOut,cacheRead:localCache,stopReason:localStop};
 
     }finally{
@@ -842,16 +867,13 @@ async function send(){
   }
 
   try{
-    /* ── Trim history before initial request ── */
     trimHistory(c.history);
 
-    /* ── Initial request ── */
     let result=await doRequest(c.history);
     totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
 
     /* ── Auto-continue loop ── */
     while(autoContEnabled&&contCount<MAX_CONT){
-      /* ── Overall timeout guard ── */
       if(Date.now()-sendStartTime>OVERALL_TIMEOUT_MS){
         console.warn('[send] Overall timeout reached ('+Math.round(OVERALL_TIMEOUT_MS/1000)+'s), stopping auto-continue');
         el.contStatus.style.display='';
@@ -859,11 +881,13 @@ async function send(){
         break;
       }
 
+      /* shouldContinue: covers both reply truncation AND thinking truncation */
       const shouldContinue=result.stopReason==='max_tokens'||
-        (!result.stopReason&&replyTxt.length>500&&looksIncomplete(replyTxt));
+        (!result.stopReason&&replyTxt.length>500&&looksIncomplete(replyTxt))||
+        (!result.stopReason&&thinkTxt.length>1000&&replyTxt.length<50);
       if(!shouldContinue)break;
 
-      if(!result.stopReason&&!looksIncomplete(replyTxt)){
+      if(!result.stopReason&&!looksIncomplete(replyTxt)&&!(thinkTxt.length>1000&&replyTxt.length<50)){
         console.log('[auto-continue] No stop_reason and text looks complete, stopping');
         break;
       }
@@ -871,25 +895,47 @@ async function send(){
       contCount++;
       console.log('[auto-continue] Starting continuation',contCount,'/',MAX_CONT);
 
+      /* ── 1-minute cooldown with countdown ── */
       el.contStatus.style.display='';
-      el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Auto-continuing… ('+contCount+'/'+MAX_CONT+')</div>';
+      const cdSec=Math.ceil(CONT_DELAY_MS/1000);
+      let cdRem=cdSec;
+      el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Cooldown '+cdRem+'s — then auto-continue ('+contCount+'/'+MAX_CONT+')</div>';
       scrollEnd();
+      const cdIntv=setInterval(()=>{
+        cdRem--;
+        if(cdRem<=0){
+          clearInterval(cdIntv);
+          el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Auto-continuing… ('+contCount+'/'+MAX_CONT+')</div>';
+          scrollEnd();
+        }else{
+          el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Cooldown '+cdRem+'s — then auto-continue ('+contCount+'/'+MAX_CONT+')</div>';
+        }
+      },1000);
 
       await sleep(CONT_DELAY_MS);
+      clearInterval(cdIntv);
 
       if(thinkTxt&&isThink){
         thinkTxt+='\n\n─── Continuation '+contCount+' ───\n\n';
         updStreamThink(el,thinkTxt);
       }
 
-      const contMsgs=[
-        ...c.history,
-        {role:'assistant',content:replyTxt},
-        {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
-      ];
+      /* Build continuation messages — handle empty replyTxt (thinking cutoff) */
+      let contMsgs;
+      if(replyTxt.trim()){
+        contMsgs=[
+          ...c.history,
+          {role:'assistant',content:replyTxt},
+          {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
+        ];
+      } else {
+        /* Thinking was cut off before any reply text — retry original messages */
+        contMsgs=[...c.history];
+      }
       trimHistory(contMsgs);
 
       const textBefore=replyTxt.length;
+      const thinkBefore=thinkTxt.length;
       try{
         result=await doRequest(contMsgs);
         totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
@@ -902,8 +948,9 @@ async function send(){
 
       el.contStatus.style.display='none';
 
-      if(replyTxt.length<=textBefore){
-        console.log('[auto-continue] No new text in continuation, stopping');
+      /* Progress check: consider both reply text AND thinking text growth */
+      if(replyTxt.length<=textBefore&&thinkTxt.length<=thinkBefore){
+        console.log('[auto-continue] No new content in continuation, stopping');
         break;
       }
     }
@@ -958,7 +1005,6 @@ async function send(){
     }
   }
 
-  /* ── Guaranteed UI recovery ── */
   updNav();save();
   clearTimeout(stallWarnTimer);
   sending=false;sendBtn.disabled=false;modSel.disabled=false;
@@ -975,7 +1021,6 @@ async function manualContinue(){
   let{replyTxt,thinkTxt,totalInTok,totalOutTok,totalCacheRead,contCount,el,model,modelId,isThink}=st;
   lastContState=null;
 
-  /* ── Stall warning for manual continue ── */
   let stallWarnTimer=null;
   function startStallWarn(){
     clearTimeout(stallWarnTimer);
@@ -1017,11 +1062,17 @@ async function manualContinue(){
     c.msgs.pop();
   }
 
-  const contMsgs=[
-    ...c.history,
-    {role:'assistant',content:replyTxt},
-    {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
-  ];
+  /* Build continuation messages — handle empty replyTxt */
+  let contMsgs;
+  if(replyTxt.trim()){
+    contMsgs=[
+      ...c.history,
+      {role:'assistant',content:replyTxt},
+      {role:'user',content:'Continue from where you left off. Do not repeat any content already written.'}
+    ];
+  } else {
+    contMsgs=[...c.history];
+  }
   trimHistory(contMsgs);
 
   const reqBody={model:modelId,max_tokens:128000,messages:contMsgs,stream:true};
@@ -1047,7 +1098,7 @@ async function manualContinue(){
         while(true){
           const{done,value}=await readWithStallTimeout(reader,STREAM_STALL_MS);
           if(done)break;
-          startStallWarn(); /* reset stall warning on each chunk */
+          startStallWarn();
           buf+=dec.decode(value,{stream:true});
           while(true){
             const nl=buf.indexOf('\n');if(nl===-1)break;
@@ -1080,7 +1131,6 @@ async function manualContinue(){
           }
         }
       }catch(streamErr){
-        /* Stream stall with any accumulated content → treat as max_tokens */
         if(streamErr.message&&streamErr.message.includes('Stream stalled')){
           console.warn('[manual-continue] Stream stalled, preserving partial content');
           localStop='max_tokens';
@@ -1109,7 +1159,6 @@ async function manualContinue(){
 
   clearStallWarn();
 
-  /* Finalize */
   cur.remove();
   if(!el.contStatus.querySelector('[style*="red"]')){
     el.contStatus.style.display='none';
@@ -1142,7 +1191,6 @@ async function manualContinue(){
 
   updNav();save();
 
-  /* ── Guaranteed UI recovery ── */
   clearTimeout(stallWarnTimer);
   sending=false;sendBtn.disabled=false;modSel.disabled=false;
   uInp.focus();
