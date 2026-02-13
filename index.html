@@ -285,11 +285,11 @@ const TIERS={opus:"Opus",sonnet:"Sonnet",haiku:"Haiku",other:"Other"};
 const MAX_CONT=30;
 
 /* ═══ ROBUSTNESS CONSTANTS ═══ */
-const FETCH_TIMEOUT_MS=180000;
-const MAX_RETRIES=2;
-const RETRY_BASE_MS=3000;
-const CONT_DELAY_MS=60000;            /* 1-min cooldown before auto-continue */
-const MAX_HISTORY_CHARS=800000;
+const FETCH_TIMEOUT_MS=60000;
+const MAX_RETRIES=3;
+const RETRY_BASE_MS=120000;
+const CONT_DELAY_MS=120000;            /* 2-min cooldown before auto-continue */
+const MAX_HISTORY_CHARS=8000000;
 const STREAM_STALL_MS=45000;
 const STALL_WARN_MS=30000;
 const OVERALL_TIMEOUT_MS=10000000;     /* cont. working total time */
@@ -1214,4 +1214,5 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
+
 
