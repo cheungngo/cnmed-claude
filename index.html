@@ -292,7 +292,7 @@ const CONT_DELAY_MS=60000;            /* 1-min cooldown before auto-continue */
 const MAX_HISTORY_CHARS=800000;
 const STREAM_STALL_MS=45000;
 const STALL_WARN_MS=30000;
-const OVERALL_TIMEOUT_MS=300000;
+const OVERALL_TIMEOUT_MS=10000000;     /* cont. working total time */
 
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
@@ -1214,3 +1214,4 @@ function closeSB(){sidebar.classList.remove('open');sbOv.classList.remove('act')
 </script>
 </body>
 </html>
+
