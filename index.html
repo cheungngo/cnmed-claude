@@ -277,14 +277,17 @@ const MODELS=[
 {id:"ggg-5-codex-high",label:"GGG-5 Codex High",pi:.939,po:7.512,tier:"other"},
 ];
 const TIERS={opus:"Opus",sonnet:"Sonnet",haiku:"Haiku",other:"Other"};
-const MAX_CONT=20;
+const MAX_CONT=8;
 
 /* ═══ ROBUSTNESS CONSTANTS ═══ */
-const FETCH_TIMEOUT_MS=180000;   /* 3 min per request */
-const MAX_RETRIES=2;             /* retries on 429/529/network */
-const RETRY_BASE_MS=3000;        /* 3s base backoff */
-const CONT_DELAY_MS=1500;        /* pause between auto-continues */
-const MAX_HISTORY_CHARS=800000;  /* ~800 KB rough payload guard */
+const FETCH_TIMEOUT_MS=180000;       /* 3 min per fetch (headers) */
+const MAX_RETRIES=2;                 /* retries on 429/529/network */
+const RETRY_BASE_MS=3000;            /* 3s base backoff */
+const CONT_DELAY_MS=1500;            /* pause between auto-continues */
+const MAX_HISTORY_CHARS=800000;      /* ~800 KB rough payload guard */
+const STREAM_STALL_MS=45000;         /* 45s no stream data → abort reader */
+const STALL_WARN_MS=30000;           /* 30s → show "taking longer" warning */
+const OVERALL_TIMEOUT_MS=300000;     /* 5 min overall send timeout */
 
 /* ═══ DOM ═══ */
 const $=s=>document.getElementById(s);
@@ -303,6 +306,20 @@ function cc(){return gc(curId)}
 
 /* ═══ UTILITY: sleep ═══ */
 function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+/* ═══ UTILITY: read from stream reader with stall timeout ═══ */
+function readWithStallTimeout(reader,ms){
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{
+      reader.cancel().catch(()=>{});
+      reject(new Error('Stream stalled (no data for '+(ms/1000)+'s)'));
+    },ms);
+    reader.read().then(
+      result=>{clearTimeout(timer);resolve(result)},
+      err=>{clearTimeout(timer);reject(err)}
+    );
+  });
+}
 
 /* ═══ STORAGE ═══ */
 function save(){try{localStorage.setItem('ccs',JSON.stringify({chats,curId}))}catch(e){}}
@@ -357,14 +374,11 @@ function looksIncomplete(text){
 
 /* ═══ HISTORY TRIMMING — prevents context overflow ═══ */
 function trimHistory(history){
-  /* Keep system-like first message if any, trim oldest pairs */
   let safety=0;
   while(history.length>2&&JSON.stringify(history).length>MAX_HISTORY_CHARS&&safety<200){
-    /* Remove the two oldest messages (user+assistant pair) */
     history.splice(0,2);
     safety++;
   }
-  /* Final sanity: if a single message is still too large, truncate its content */
   if(history.length>0&&JSON.stringify(history).length>MAX_HISTORY_CHARS){
     for(let i=0;i<history.length;i++){
       if(typeof history[i].content==='string'&&history[i].content.length>50000){
@@ -385,7 +399,6 @@ async function fetchWithRetry(url,opts,retries){
     try{
       const res=await fetch(url,{...opts,signal:controller.signal});
       clearTimeout(tid);
-      /* Retry on transient server errors */
       if((res.status===429||res.status===529||res.status>=500)&&attempt<retries){
         const delay=RETRY_BASE_MS*Math.pow(2,attempt);
         console.warn('[fetchWithRetry] HTTP',res.status,'— retrying in',delay+'ms (attempt',attempt+1+'/'+retries+')');
@@ -625,7 +638,6 @@ function mkStreamEl(model){
   const cur=document.createElement('span');cur.className='cursor';body.appendChild(cur);
   msg.appendChild(body);
 
-  /* Continuation status — OUTSIDE body so updStreamText won't destroy it */
   const contStatus=document.createElement('div');contStatus.className='cont-status';contStatus.style.display='none';
   msg.appendChild(contStatus);
 
@@ -684,6 +696,28 @@ async function send(){
   const el=mkStreamEl(model);
   chatArea.appendChild(el.row);scrollEnd();
 
+  /* ── Overall timeout tracking ── */
+  const sendStartTime=Date.now();
+
+  /* ── Stall warning (visual "Taking longer than usual…") ── */
+  let stallWarnTimer=null;
+  function startStallWarn(){
+    clearTimeout(stallWarnTimer);
+    stallWarnTimer=setTimeout(()=>{
+      el.contStatus.style.display='';
+      el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--yel)"><span class="pulse" style="background:var(--yel)"></span> Taking longer than usual…</div>';
+      scrollEnd();
+    },STALL_WARN_MS);
+  }
+  function clearStallWarn(){
+    clearTimeout(stallWarnTimer);
+    stallWarnTimer=null;
+    if(el.contStatus.innerHTML.includes('Taking longer')){
+      el.contStatus.style.display='none';
+      el.contStatus.innerHTML='';
+    }
+  }
+
   /* Accumulation across continuations */
   let thinkTxt='',replyTxt='';
   let totalInTok=0,totalOutTok=0,totalCacheRead=0;
@@ -699,94 +733,112 @@ async function send(){
 
     console.log('[auto-continue] Sending request, messages:',messages.length,'continuation:',contCount);
 
-    const res=await fetchWithRetry('/.netlify/functions/claude-proxy',{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
-    });
+    startStallWarn();
 
-    if(!res.ok){
-      const ed=await res.json().catch(()=>({}));
-      const em=ed.error?.message||ed.error||'HTTP '+res.status;
-      throw new Error(em);
-    }
+    try{
+      const res=await fetchWithRetry('/.netlify/functions/claude-proxy',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
+      });
 
-    const ct=res.headers.get('content-type')||'';
-    if(ct.includes('text/event-stream')&&res.body){
-      const reader=res.body.getReader();
-      const dec=new TextDecoder();
-      let buf='';
+      if(!res.ok){
+        const ed=await res.json().catch(()=>({}));
+        const em=ed.error?.message||ed.error||'HTTP '+res.status;
+        throw new Error(em);
+      }
 
-      while(true){
-        const{done,value}=await reader.read();
-        if(done)break;
-        buf+=dec.decode(value,{stream:true});
-        while(true){
-          const nl=buf.indexOf('\n');if(nl===-1)break;
-          const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
-          if(!line||line.startsWith('event:')||!line.startsWith('data:'))continue;
-          const ds=line.slice(5).trim();if(!ds||ds==='[DONE]')continue;
-          try{
-            const ev=JSON.parse(ds);
-            switch(ev.type){
-              case'message_start':
-                if(ev.message?.usage){
-                  localIn=ev.message.usage.input_tokens||0;
-                  if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens;
+      const ct=res.headers.get('content-type')||'';
+      if(ct.includes('text/event-stream')&&res.body){
+        const reader=res.body.getReader();
+        const dec=new TextDecoder();
+        let buf='';
+
+        try{
+          while(true){
+            const{done,value}=await readWithStallTimeout(reader,STREAM_STALL_MS);
+            if(done)break;
+            startStallWarn(); /* reset visual stall warning on each chunk */
+            buf+=dec.decode(value,{stream:true});
+            while(true){
+              const nl=buf.indexOf('\n');if(nl===-1)break;
+              const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
+              if(!line||line.startsWith('event:')||!line.startsWith('data:'))continue;
+              const ds=line.slice(5).trim();if(!ds||ds==='[DONE]')continue;
+              try{
+                const ev=JSON.parse(ds);
+                switch(ev.type){
+                  case'message_start':
+                    if(ev.message?.usage){
+                      localIn=ev.message.usage.input_tokens||0;
+                      if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens;
+                    }
+                    if(ev.message?.stop_reason)localStop=ev.message.stop_reason;
+                    break;
+                  case'content_block_start':
+                    if(ev.content_block?.type==='thinking'){el.tk.style.display=''}
+                    break;
+                  case'content_block_delta':
+                    if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
+                    else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
+                    break;
+                  case'content_block_stop':break;
+                  case'message_delta':
+                    if(ev.usage)localOut=ev.usage.output_tokens||0;
+                    if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
+                    else if(ev.stop_reason)localStop=ev.stop_reason;
+                    console.log('[auto-continue] message_delta — stop_reason:',localStop,'outTok:',localOut);
+                    break;
+                  case'message_stop':
+                    if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
+                    else if(ev.stop_reason)localStop=ev.stop_reason;
+                    break;
+                  case'error':throw new Error(ev.error?.message||'Stream error');
                 }
-                if(ev.message?.stop_reason)localStop=ev.message.stop_reason;
-                break;
-              case'content_block_start':
-                if(ev.content_block?.type==='thinking'){el.tk.style.display=''}
-                break;
-              case'content_block_delta':
-                if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
-                else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
-                break;
-              case'content_block_stop':break;
-              case'message_delta':
-                if(ev.usage)localOut=ev.usage.output_tokens||0;
-                if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
-                else if(ev.stop_reason)localStop=ev.stop_reason;
-                console.log('[auto-continue] message_delta — stop_reason:',localStop,'outTok:',localOut);
-                break;
-              case'message_stop':
-                if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
-                else if(ev.stop_reason)localStop=ev.stop_reason;
-                break;
-              case'error':throw new Error(ev.error?.message||'Stream error');
+              }catch(pe){if(pe.message&&(pe.message.includes('Stream error')||pe.message.includes('error')))throw pe}
             }
-          }catch(pe){if(pe.message&&(pe.message.includes('Stream error')||pe.message.includes('error')))throw pe}
+          }
+        }catch(streamErr){
+          /* Stream stall with partial content → treat as max_tokens for auto-continue */
+          if(streamErr.message&&streamErr.message.includes('Stream stalled')&&replyTxt.length>200){
+            console.warn('[stream] Stall with partial content, treating as max_tokens');
+            localStop='max_tokens';
+          }else{
+            throw streamErr;
+          }
         }
-      }
-    } else {
-      /* Non-streaming JSON fallback */
-      const data=await res.json();
-      console.log('[auto-continue] Non-stream response, stop_reason:', data.stop_reason);
-      if(data.content&&Array.isArray(data.content)){
-        for(const b of data.content){
-          if(b.type==='thinking')thinkTxt+=b.thinking;
-          else if(b.type==='text')replyTxt+=b.text;
+      } else {
+        /* Non-streaming JSON fallback */
+        const data=await res.json();
+        console.log('[auto-continue] Non-stream response, stop_reason:', data.stop_reason);
+        if(data.content&&Array.isArray(data.content)){
+          for(const b of data.content){
+            if(b.type==='thinking')thinkTxt+=b.thinking;
+            else if(b.type==='text')replyTxt+=b.text;
+          }
         }
+        if(data.usage){
+          localIn=data.usage.input_tokens||0;
+          localOut=data.usage.output_tokens||0;
+          if(data.usage.cache_read_input_tokens)localCache=data.usage.cache_read_input_tokens;
+        }
+        localStop=data.stop_reason||'';
+        if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
       }
-      if(data.usage){
-        localIn=data.usage.input_tokens||0;
-        localOut=data.usage.output_tokens||0;
-        if(data.usage.cache_read_input_tokens)localCache=data.usage.cache_read_input_tokens;
+
+      /* Force-flush any pending RAF so UI is up to date */
+      flushMd(el,replyTxt);
+
+      /* Heuristic fallback: if no stop_reason but response looks truncated */
+      if(!localStop&&replyTxt.length>200&&looksIncomplete(replyTxt)){
+        console.log('[auto-continue] No stop_reason but heuristic detected truncation');
+        localStop='max_tokens';
       }
-      localStop=data.stop_reason||'';
-      if(thinkTxt){el.tk.style.display='';updStreamThink(el,thinkTxt)}
+
+      console.log('[auto-continue] Request done — stop:',localStop,'in:',localIn,'out:',localOut,'replyLen:',replyTxt.length);
+      return{inTok:localIn,outTok:localOut,cacheRead:localCache,stopReason:localStop};
+
+    }finally{
+      clearStallWarn();
     }
-
-    /* Force-flush any pending RAF so UI is up to date */
-    flushMd(el,replyTxt);
-
-    /* Heuristic fallback: if no stop_reason but response looks truncated */
-    if(!localStop&&replyTxt.length>200&&looksIncomplete(replyTxt)){
-      console.log('[auto-continue] No stop_reason but heuristic detected truncation');
-      localStop='max_tokens';
-    }
-
-    console.log('[auto-continue] Request done — stop:',localStop,'in:',localIn,'out:',localOut,'replyLen:',replyTxt.length);
-    return{inTok:localIn,outTok:localOut,cacheRead:localCache,stopReason:localStop};
   }
 
   try{
@@ -799,11 +851,18 @@ async function send(){
 
     /* ── Auto-continue loop ── */
     while(autoContEnabled&&contCount<MAX_CONT){
+      /* ── Overall timeout guard ── */
+      if(Date.now()-sendStartTime>OVERALL_TIMEOUT_MS){
+        console.warn('[send] Overall timeout reached ('+Math.round(OVERALL_TIMEOUT_MS/1000)+'s), stopping auto-continue');
+        el.contStatus.style.display='';
+        el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--yel)">⏳ Overall timeout reached, stopping auto-continue</div>';
+        break;
+      }
+
       const shouldContinue=result.stopReason==='max_tokens'||
         (!result.stopReason&&replyTxt.length>500&&looksIncomplete(replyTxt));
       if(!shouldContinue)break;
 
-      /* Safety: if stopReason is missing/unknown and not heuristically truncated, bail */
       if(!result.stopReason&&!looksIncomplete(replyTxt)){
         console.log('[auto-continue] No stop_reason and text looks complete, stopping');
         break;
@@ -812,21 +871,17 @@ async function send(){
       contCount++;
       console.log('[auto-continue] Starting continuation',contCount,'/',MAX_CONT);
 
-      /* Show indicator (in contStatus, NOT in body) */
       el.contStatus.style.display='';
       el.contStatus.innerHTML='<div class="cont-ind"><span class="pulse"></span> Auto-continuing… ('+contCount+'/'+MAX_CONT+')</div>';
       scrollEnd();
 
-      /* Delay between continuations to avoid rate-limiting */
       await sleep(CONT_DELAY_MS);
 
-      /* Thinking separator */
       if(thinkTxt&&isThink){
         thinkTxt+='\n\n─── Continuation '+contCount+' ───\n\n';
         updStreamThink(el,thinkTxt);
       }
 
-      /* Build continuation messages — trim if too large */
       const contMsgs=[
         ...c.history,
         {role:'assistant',content:replyTxt},
@@ -840,7 +895,6 @@ async function send(){
         totalInTok+=result.inTok;totalOutTok+=result.outTok;totalCacheRead+=result.cacheRead;
       }catch(contErr){
         console.warn('[auto-continue] Continuation',contCount,'failed:',contErr.message);
-        /* Show the error in the status area, then stop the loop */
         el.contStatus.style.display='';
         el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Auto-continue stopped: '+esc(contErr.message)+'</div>';
         break;
@@ -848,7 +902,6 @@ async function send(){
 
       el.contStatus.style.display='none';
 
-      /* Safety: if no new text was added, stop */
       if(replyTxt.length<=textBefore){
         console.log('[auto-continue] No new text in continuation, stopping');
         break;
@@ -875,7 +928,6 @@ async function send(){
       if(contCount>0)el.ft.innerHTML+='<span class="cont-badge">🔄 '+contCount+' continuation'+(contCount>1?'s':'')+'</span>';
     }
 
-    /* Manual continue button if still looks incomplete or hit limit */
     const stillIncomplete=(result.stopReason==='max_tokens')||(looksIncomplete(replyTxt));
     if(stillIncomplete){
       const mcBtn=document.createElement('button');mcBtn.className='cont-btn';mcBtn.innerHTML='↻ Continue';
@@ -906,7 +958,9 @@ async function send(){
     }
   }
 
+  /* ── Guaranteed UI recovery ── */
   updNav();save();
+  clearTimeout(stallWarnTimer);
   sending=false;sendBtn.disabled=false;modSel.disabled=false;
   uInp.focus();
 }
@@ -921,10 +975,27 @@ async function manualContinue(){
   let{replyTxt,thinkTxt,totalInTok,totalOutTok,totalCacheRead,contCount,el,model,modelId,isThink}=st;
   lastContState=null;
 
-  /* Remove old manual continue button */
+  /* ── Stall warning for manual continue ── */
+  let stallWarnTimer=null;
+  function startStallWarn(){
+    clearTimeout(stallWarnTimer);
+    stallWarnTimer=setTimeout(()=>{
+      el.contStatus.style.display='';
+      el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--yel)"><span class="pulse" style="background:var(--yel)"></span> Taking longer than usual…</div>';
+      scrollEnd();
+    },STALL_WARN_MS);
+  }
+  function clearStallWarn(){
+    clearTimeout(stallWarnTimer);
+    stallWarnTimer=null;
+    if(el.contStatus.innerHTML.includes('Taking longer')){
+      el.contStatus.style.display='none';
+      el.contStatus.innerHTML='';
+    }
+  }
+
   const oldBtn=el.ft.querySelector('.cont-btn');if(oldBtn)oldBtn.remove();
 
-  /* Re-add cursor */
   const cur=document.createElement('span');cur.className='cursor';
   el.body.appendChild(cur);
   el.cur=cur;
@@ -939,16 +1010,13 @@ async function manualContinue(){
     updStreamThink(el,thinkTxt);
   }
 
-  /* Remove last assistant msg from history (we'll re-add with full text) */
   if(c.history.length&&c.history[c.history.length-1].role==='assistant'){
     c.history.pop();
   }
-  /* Also remove from msgs */
   if(c.msgs.length&&c.msgs[c.msgs.length-1].role==='assistant'){
     c.msgs.pop();
   }
 
-  /* Build and trim continuation messages */
   const contMsgs=[
     ...c.history,
     {role:'assistant',content:replyTxt},
@@ -962,6 +1030,8 @@ async function manualContinue(){
   let localIn=0,localOut=0,localCache=0,localStop='';
 
   try{
+    startStallWarn();
+
     const res=await fetchWithRetry('/.netlify/functions/claude-proxy',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reqBody)
     });
@@ -972,38 +1042,50 @@ async function manualContinue(){
       const reader=res.body.getReader();
       const dec=new TextDecoder();
       let buf='';
-      while(true){
-        const{done,value}=await reader.read();
-        if(done)break;
-        buf+=dec.decode(value,{stream:true});
+
+      try{
         while(true){
-          const nl=buf.indexOf('\n');if(nl===-1)break;
-          const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
-          if(!line||line.startsWith('event:')||!line.startsWith('data:'))continue;
-          const ds=line.slice(5).trim();if(!ds||ds==='[DONE]')continue;
-          try{
-            const ev=JSON.parse(ds);
-            switch(ev.type){
-              case'message_start':
-                if(ev.message?.usage){localIn=ev.message.usage.input_tokens||0;if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens}
-                break;
-              case'content_block_start':if(ev.content_block?.type==='thinking')el.tk.style.display='';break;
-              case'content_block_delta':
-                if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
-                else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
-                break;
-              case'message_delta':
-                if(ev.usage)localOut=ev.usage.output_tokens||0;
-                if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
-                else if(ev.stop_reason)localStop=ev.stop_reason;
-                break;
-              case'message_stop':
-                if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
-                else if(ev.stop_reason)localStop=ev.stop_reason;
-                break;
-              case'error':throw new Error(ev.error?.message||'Stream error');
-            }
-          }catch(pe){if(pe.message&&(pe.message.includes('Stream error')||pe.message.includes('error')))throw pe}
+          const{done,value}=await readWithStallTimeout(reader,STREAM_STALL_MS);
+          if(done)break;
+          startStallWarn(); /* reset stall warning on each chunk */
+          buf+=dec.decode(value,{stream:true});
+          while(true){
+            const nl=buf.indexOf('\n');if(nl===-1)break;
+            const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
+            if(!line||line.startsWith('event:')||!line.startsWith('data:'))continue;
+            const ds=line.slice(5).trim();if(!ds||ds==='[DONE]')continue;
+            try{
+              const ev=JSON.parse(ds);
+              switch(ev.type){
+                case'message_start':
+                  if(ev.message?.usage){localIn=ev.message.usage.input_tokens||0;if(ev.message.usage.cache_read_input_tokens)localCache=ev.message.usage.cache_read_input_tokens}
+                  break;
+                case'content_block_start':if(ev.content_block?.type==='thinking')el.tk.style.display='';break;
+                case'content_block_delta':
+                  if(ev.delta?.type==='thinking_delta'){thinkTxt+=ev.delta.thinking;updStreamThink(el,thinkTxt)}
+                  else if(ev.delta?.type==='text_delta'){replyTxt+=ev.delta.text;updStreamText(el,replyTxt)}
+                  break;
+                case'message_delta':
+                  if(ev.usage)localOut=ev.usage.output_tokens||0;
+                  if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
+                  else if(ev.stop_reason)localStop=ev.stop_reason;
+                  break;
+                case'message_stop':
+                  if(ev.delta?.stop_reason)localStop=ev.delta.stop_reason;
+                  else if(ev.stop_reason)localStop=ev.stop_reason;
+                  break;
+                case'error':throw new Error(ev.error?.message||'Stream error');
+              }
+            }catch(pe){if(pe.message&&(pe.message.includes('Stream error')||pe.message.includes('error')))throw pe}
+          }
+        }
+      }catch(streamErr){
+        /* Stream stall with any accumulated content → treat as max_tokens */
+        if(streamErr.message&&streamErr.message.includes('Stream stalled')){
+          console.warn('[manual-continue] Stream stalled, preserving partial content');
+          localStop='max_tokens';
+        }else{
+          throw streamErr;
         }
       }
     } else {
@@ -1025,9 +1107,10 @@ async function manualContinue(){
     el.contStatus.innerHTML='<div class="cont-ind" style="color:var(--red)">⚠ Continue failed: '+esc(err.message)+'</div>';
   }
 
+  clearStallWarn();
+
   /* Finalize */
   cur.remove();
-  /* Only hide contStatus if no error was shown */
   if(!el.contStatus.querySelector('[style*="red"]')){
     el.contStatus.style.display='none';
   }
@@ -1045,7 +1128,6 @@ async function manualContinue(){
   if(contCount>0)el.ft.innerHTML+='<span class="cont-badge">🔄 '+contCount+' continuation'+(contCount>1?'s':'')+'</span>';
   el.ft.style.display='';
 
-  /* Show continue button again if still incomplete */
   if(!localStop)localStop=(looksIncomplete(replyTxt)?'max_tokens':'');
   if(localStop==='max_tokens'||looksIncomplete(replyTxt)){
     const mcBtn=document.createElement('button');mcBtn.className='cont-btn';mcBtn.innerHTML='↻ Continue';
@@ -1059,6 +1141,9 @@ async function manualContinue(){
   c.msgs.push(aMsg);c.history.push({role:'assistant',content:replyTxt||''});
 
   updNav();save();
+
+  /* ── Guaranteed UI recovery ── */
+  clearTimeout(stallWarnTimer);
   sending=false;sendBtn.disabled=false;modSel.disabled=false;
   uInp.focus();
 }
